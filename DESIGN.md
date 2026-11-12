@@ -152,3 +152,10 @@ refused at deploy.
 Since G10.2 Docker publishes nothing for a workload on the overlay: the mesh alone answers its ports, on its own node
 too (the prerouting and output chains), so two replicas of a service may run on one node. A target whose node
 reports it not running is taken out of the map until it runs again.
+
+G10.3, built as above: a floating address is held through Raft (`FloatingHeld`, refused while its holder is neither
+fenced nor gone), on `fd-ext` as a /32, and announced with `arping -U` on the interface whose network holds it. The
+LAN interface answers ARP for it because Linux answers for any local address by default (`arp_ignore=0`); a node
+that sets it otherwise answers for none. A holder the cluster starts to fence is sent no floating address, and a
+worker that fences itself takes them off first, so between its own timers and the managers' presumption there is a
+gap with nobody answering (about 50 s with the default timers on the test cluster), never one with two.
