@@ -92,7 +92,7 @@ pub fn plan(want: &Have, have: &Have) -> Vec<Change> {
 }
 
 /// The node's nftables table, whole: in the forward path, a stack's addresses reach that stack's only, and any other
-/// traffic between two addresses of the cluster's range is dropped. Only the range is touched; the host's own rules
+/// traffic between two addresses of the cluster's range is dropped; traffic leaving the range is masqueraded. Only the range is touched; the host's own rules
 /// and Docker's are other tables.
 pub fn ruleset(s: &v1::NetworkState) -> Result<String> {
     let r = range(s)?;
@@ -104,7 +104,10 @@ pub fn ruleset(s: &v1::NetworkState) -> Result<String> {
         inside(r, sub, "24")?;
         out.push_str(&format!("    ip saddr {sub} ip daddr {sub} accept\n"));
     }
-    out.push_str(&format!("    ip saddr {0} ip daddr {0} drop\n  }}\n}}\n", s.cluster_range));
+    out.push_str(&format!("    ip saddr {0} ip daddr {0} drop\n  }}\n", s.cluster_range));
+    // Stack networks have Docker's masquerade off (it would rewrite traffic into the overlay too): what leaves the
+    // range for anywhere but a stack bridge or the overlay is masqueraded here.
+    out.push_str(&format!("  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    ip saddr {0} ip daddr != {0} oifname != \"fd-*\" masquerade\n  }}\n}}\n", s.cluster_range));
     Ok(out)
 }
 
@@ -175,6 +178,7 @@ mod tests {
         assert!(r.contains("ip saddr 10.240.1.0/24 ip daddr 10.240.1.0/24 accept"), "{r}");
         assert!(r.contains("ip saddr 10.240.2.0/24 ip daddr 10.240.2.0/24 accept"), "{r}");
         assert!(r.contains("ip saddr 10.240.0.0/16 ip daddr 10.240.0.0/16 drop"), "and the rest of the range dropped:\n{r}");
+        assert!(r.contains("type nat hook postrouting priority srcnat;") && r.contains(r#"ip saddr 10.240.0.0/16 ip daddr != 10.240.0.0/16 oifname != "fd-*" masquerade"#), "out to the world masqueraded, never into the overlay:\n{r}");
         assert_eq!(r, ruleset(&state(&[], &[("b", "10.240.2.0/24"), ("a", "10.240.1.0/24")])).unwrap(), "the same text for the same state");
         assert!(ruleset(&state(&[], &[("x", "10.241.0.0/24")])).is_err(), "a subnet outside the range");
     }

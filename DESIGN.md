@@ -53,7 +53,21 @@ hand every node the others' keys, endpoints (the address its worker connects fro
   is made (`extra_hosts`). Addresses are stable, so a move changes nothing; scaling a service rewrites the others at
   the next deploy. A DNS server of our own is left for when this is not enough.
 - **The host's own network is untouched** (6.2): one interface `fd0`, the bridges Docker makes, routes inside the
-  cluster range only, and our own nftables table.
+  cluster range only, and our own nftables table (the filter above and the masquerade below).
+
+### Found on the test cluster (Docker 29.0, 2026-11-12)
+
+A hand-made overlay between two nodes, before any code: the WireGuard handshake came up at once, but nothing reached
+the container. Docker drops, in the `raw` table, every packet for a container's address that arrives on another
+interface ("direct routing" protection), and in `filter` everything into a bridge it did not publish. A stack network
+is therefore made with `com.docker.network.bridge.gateway_mode_ipv4=nat-unprotected` (neither rule) and
+`enable_ip_masquerade=false` (Docker's masquerade would also rewrite traffic into `fd0`, hiding which stack sent it);
+our own table masquerades what leaves the cluster range for anywhere but a stack bridge:
+`ip saddr <range> ip daddr != <range> oifname != "fd-*" masquerade`. With that, a container on one node reached
+nginx on the other by address, the far end saw the real source address, and both still reached the internet.
+
+The agent drives the established tools rather than netlink, so what it does can be read and done by hand: `ip`,
+`wg` (wireguard-tools, installed with the node) and `nft`.
 
 ## Where it runs
 
