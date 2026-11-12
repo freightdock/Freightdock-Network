@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some("rules") => {
-            let ex = |port, targets: &[&str]| v1::Exposure { stack: "web".into(), protocol: "tcp".into(), port, targets: targets.iter().map(|t| t.to_string()).collect() };
+            let ex = |port, targets: &[&str]| v1::Exposure { stack: "web".into(), protocol: "tcp".into(), port, targets: targets.iter().map(|t| t.to_string()).collect(), address: String::new() };
             let s = v1::NetworkState {
                 version: 1,
                 cluster_range: "10.240.0.0/16".into(),

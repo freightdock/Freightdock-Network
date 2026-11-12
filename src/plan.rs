@@ -110,16 +110,16 @@ pub fn want(s: &v1::NetworkState) -> Result<Have> {
 /// the cluster's range, a loopback, link-local, multicast or broadcast one. Refused whole otherwise.
 pub fn floating(s: &v1::NetworkState) -> Result<BTreeSet<String>> {
     let r = range(s)?;
-    s.floating
-        .iter()
-        .map(|f| {
-            let Ok(ip) = f.parse::<std::net::Ipv4Addr>() else { bail!("the floating address {f:?} is not an IPv4 address") };
-            if ip.is_unspecified() || ip.is_loopback() || ip.is_link_local() || ip.is_multicast() || ip.is_broadcast() || ip.octets()[0] == 0 || ip.octets()[..2] == r {
-                bail!("{ip} cannot be a floating address (not a LAN's, or the cluster's own range)");
-            }
-            Ok(format!("{ip}/32"))
-        })
-        .collect()
+    s.floating.iter().map(|f| Ok(format!("{}/32", lan_address(r, f)?))).collect()
+}
+
+/// `f` as a floating address: a unicast IPv4 address a LAN could have, outside the range.
+fn lan_address(r: [u8; 2], f: &str) -> Result<std::net::Ipv4Addr> {
+    let Ok(ip) = f.parse::<std::net::Ipv4Addr>() else { bail!("the floating address {f:?} is not an IPv4 address") };
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_link_local() || ip.is_multicast() || ip.is_broadcast() || ip.octets()[0] == 0 || ip.octets()[..2] == r {
+        bail!("{ip} cannot be a floating address (not a LAN's, or the cluster's own range)");
+    }
+    Ok(ip)
 }
 
 /// The changes that make `have` into `want`, in a safe order: routes away first, then peers away, peers set, routes
@@ -134,9 +134,10 @@ pub fn plan(want: &Have, have: &Have) -> Vec<Change> {
     out
 }
 
-/// One published port's rule: `fib daddr type local <proto> dport <port> dnat ...` to its one workload, or spread over
-/// its workloads at random. `None` with nothing behind it.
-fn exposure_rule(r: [u8; 2], e: &v1::Exposure) -> Result<Option<String>> {
+/// One published port's rule, to its one workload or spread over its workloads at random; `None` with nothing behind
+/// it. A Compose file's port matches every local address but the floating ones the node holds (`pool`), so those
+/// answer only what was exposed on them; an exposure on a floating address (G10.5) matches that address only.
+fn exposure_rule(r: [u8; 2], e: &v1::Exposure, pool: &[std::net::Ipv4Addr]) -> Result<Option<String>> {
     if !matches!(e.protocol.as_str(), "tcp" | "udp") {
         bail!("{:?} is not tcp or udp", e.protocol);
     }
@@ -153,7 +154,14 @@ fn exposure_rule(r: [u8; 2], e: &v1::Exposure) -> Result<Option<String>> {
         }
         to.push((ip.to_string(), port));
     }
-    let head = format!("fib daddr type local {} dport {} dnat ip to", e.protocol, e.port);
+    let at = if !e.address.is_empty() {
+        format!("ip daddr {}", lan_address(r, &e.address)?)
+    } else if pool.is_empty() {
+        "fib daddr type local".to_string()
+    } else {
+        format!("fib daddr type local ip daddr != {{ {} }}", pool.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "))
+    };
+    let head = format!("{at} {} dport {} dnat ip to", e.protocol, e.port);
     Ok(match to.as_slice() {
         [] => None,
         [(ip, port)] => Some(format!("{head} {ip}:{port}")),
@@ -188,9 +196,11 @@ pub fn ruleset(s: &v1::NetworkState) -> Result<String> {
         out.push_str(&format!("    ip saddr {sub} ip daddr {sub} accept\n"));
     }
     out.push_str(&format!("    ip saddr {range} ip daddr {range} drop\n  }}\n"));
+    let mut pool = s.floating.iter().map(|f| lan_address(r, f)).collect::<Result<Vec<_>>>()?;
+    pool.sort();
     let mut rules = vec![];
     for e in &s.exposures {
-        rules.extend(exposure_rule(r, e)?);
+        rules.extend(exposure_rule(r, e, &pool)?);
     }
     rules.sort();
     out.push_str("  chain prerouting {\n    type nat hook prerouting priority dstnat - 10; policy accept;\n");
@@ -229,7 +239,26 @@ mod tests {
     }
 
     fn exposure(port: u32, proto: &str, targets: &[&str]) -> v1::Exposure {
-        v1::Exposure { stack: "a".into(), protocol: proto.into(), port, targets: targets.iter().map(|t| t.to_string()).collect() }
+        v1::Exposure { stack: "a".into(), protocol: proto.into(), port, targets: targets.iter().map(|t| t.to_string()).collect(), address: String::new() }
+    }
+
+    #[test]
+    fn a_floating_address_answers_only_its_own_exposures_and_a_port_is_its_own_there() {
+        let mut s = state(&[], &[("a", "10.240.1.0/24")]);
+        s.floating = vec!["192.0.2.10".into(), "192.0.2.11".into()];
+        let on = |addr: &str, port, t: &str| v1::Exposure { address: addr.into(), ..exposure(port, "tcp", &[t]) };
+        s.exposures = vec![exposure(8088, "tcp", &["10.240.1.3:80"]), on("192.0.2.10", 443, "10.240.1.3:8443"), on("192.0.2.11", 443, "10.240.1.4:443")];
+        let r = ruleset(&s).unwrap();
+        assert!(r.contains("    fib daddr type local ip daddr != { 192.0.2.10, 192.0.2.11 } tcp dport 8088 dnat ip to 10.240.1.3:80\n"), "a Compose port never on the pool:\n{r}");
+        assert!(r.contains("    ip daddr 192.0.2.10 tcp dport 443 dnat ip to 10.240.1.3:8443\n"), "{r}");
+        assert!(r.contains("    ip daddr 192.0.2.11 tcp dport 443 dnat ip to 10.240.1.4:443\n"), "one port on two addresses:\n{r}");
+        assert!(r.contains("    ip daddr != 127.0.0.0/8 ip daddr 192.0.2.10 tcp dport 443 dnat ip to 10.240.1.3:8443\n"), "the host's own traffic too:\n{r}");
+        s.floating.clear();
+        assert!(ruleset(&s).unwrap().contains("    fib daddr type local tcp dport 8088 dnat"), "nothing to leave out on a node holding none");
+        for bad in ["10.240.0.9", "127.0.0.1", "x", "192.0.2.10/32"] {
+            s.exposures = vec![on(bad, 443, "10.240.1.3:80")];
+            assert!(ruleset(&s).is_err(), "{bad}");
+        }
     }
 
     #[test]

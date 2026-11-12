@@ -171,3 +171,16 @@ a workload of the node). The second leg of a mesh forward comes from a node's ad
 outside the cluster is not named (only "outside" and the port it came in on); a destination outside is "outside"
 with its port. The managers turn the overlay addresses into workloads and nodes for the UI.
 
+# G10.5: exposures on the pool (agreed 2026-11-13, the owner's words in short)
+
+A floating address is a pool address, not a node's: a stack picks an address and a port from the pool for a service,
+outside its Compose file, and two stacks may use the same port on two addresses ("it would really reduce scalability
+if we could only use a port once"). The address and port follow the workloads wherever they run (the mesh). Ready-made
+Compose files work unchanged.
+
+What leaves the cluster is only what was meant to: an exposure (pool address, port, protocol to a service's container
+port) answers on its address alone; a Compose file's `ports:` answers on the nodes' own addresses only, never on a
+pool address (`fib daddr type local ip daddr != { <pool held here> }`); everything else is internal, reached by name
+inside its stack, and says so in the UI. A port is unique per address and protocol, and a pool address in use cannot
+be taken out of the pool.
+
