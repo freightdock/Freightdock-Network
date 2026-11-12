@@ -111,7 +111,8 @@ reconcile, never a sequence of commands to replay.
 Exposing services from outside, external IPs and gateways (G10); nodes that cannot be dialled (NAT traversal or a
 relay); IPv6 inside the overlay; a cluster DNS server; network policy finer than "a stack talks to itself".
 
-# G10: external networking, the draft (not agreed yet)
+# G10: external networking (agreed 2026-11-12: the mesh first, floating IPs next; the client's address across
+# nodes later)
 
 The plan (2.4, 4.5, 6.5) asks for exposures keyed by external IP, protocol and port, forwarded by the workers (or
 designated gateways), never through a manager, the external IP stable when the workload moves, several workloads
@@ -136,3 +137,14 @@ must have its reply come back through the node it came in on, so it is masquerad
 the workload sees the node, not the client (as Swarm's routing mesh and Kubernetes' NodePort do by default). Keeping
 it across nodes needs policy routing on the replies, left for later. Both are refused for ports the host uses
 itself (22, the managers' 7450 to 7453, 51820).
+
+### Found on the test cluster (2026-11-12)
+
+By hand first, then built: Docker's FORWARD chain drops what comes in on the LAN interface and goes out `fd0` (it
+accepts only its own bridges), so two rules in `DOCKER-USER`, the chain Docker keeps for its users, let the mesh's
+connections and their replies through. The node needs an address on `fd0` for the masquerade (`10.240.0.<n>`, given
+by the managers at enrolment), and the far node's stack filter must let replies (`ct state established`) and the
+nodes' addresses through. With that: a port published by a workload on one node answered on both, the workload saw
+the client's address when it came in on its own node and the forwarding node's otherwise, the host's own traffic to
+its address worked, a port was spread over two replicas, and a port taken by another stack or kept by the host was
+refused at deploy.

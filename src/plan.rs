@@ -28,9 +28,7 @@ pub struct Have {
     pub addresses: BTreeSet<String>,
 }
 
-/// Ports the host keeps for itself, never published through the mesh: ssh, the managers' (7450 the cluster, 7451
-/// and 7452 their API) and WireGuard's.
-pub const RESERVED_PORTS: [u32; 5] = [22, 7450, 7451, 7452, 51820];
+pub use freightdock_proto::RESERVED_PORTS;
 
 /// A stack's bridge: `fd-<stack>`, or for a stack whose name makes that longer than Linux's 15 characters, `fd-`
 /// and twelve hex characters of its name's hash. Always `fd-...`, which the masquerade of what leaves the range
