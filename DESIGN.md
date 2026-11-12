@@ -110,3 +110,29 @@ reconcile, never a sequence of commands to replay.
 
 Exposing services from outside, external IPs and gateways (G10); nodes that cannot be dialled (NAT traversal or a
 relay); IPv6 inside the overlay; a cluster DNS server; network policy finer than "a stack talks to itself".
+
+# G10: external networking, the draft (not agreed yet)
+
+The plan (2.4, 4.5, 6.5) asks for exposures keyed by external IP, protocol and port, forwarded by the workers (or
+designated gateways), never through a manager, the external IP stable when the workload moves, several workloads
+sharing one IP on different ports, and the host's own network left alone.
+
+Today a published port (`ports: ["8088:80"]`) is Docker's: it answers only on the node the workload runs on, so its
+address moves with the workload. Two ways to make it stable, which fit together:
+
+- **A port on every worker (a routing mesh).** A stack's published port answers on every worker's own address: our
+  `table inet freightdock` DNATs `<any worker>:8088` to the workload's overlay address (`10.240.x.y:80`), wherever it
+  runs, and spreads over the replicas (`numgen random mod N`). Nothing on the host's interfaces changes. A move
+  changes one map element on each node. The external IP is any worker's, put behind DNS or a load balancer the
+  administrator already has.
+- **Floating external IPs (VIPs).** An address the administrator gives the cluster (from its LAN), held by one
+  worker at a time, the gateway, chosen by the managers: added as a /32 on an interface of our own (`fd-ext`), with
+  ARP answered on the LAN interface for that address only, and a gratuitous ARP when it moves. Its ports DNAT as
+  above. It moves when its gateway is fenced (never while the old holder may still answer: the fencing guarantee
+  again). Gateway redundancy beyond that is G12.
+
+The client's address: a connection that comes in on the workload's own node keeps it. One forwarded to another node
+must have its reply come back through the node it came in on, so it is masqueraded to that node's overlay side, and
+the workload sees the node, not the client (as Swarm's routing mesh and Kubernetes' NodePort do by default). Keeping
+it across nodes needs policy routing on the replies, left for later. Both are refused for ports the host uses
+itself (22, the managers' 7450 to 7453, 51820).

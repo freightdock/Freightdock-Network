@@ -58,6 +58,7 @@ impl<R: Run> Agent<R> {
         let rules = ruleset(s)?;
         self.interface(if s.mtu == 0 { 1420 } else { s.mtu })?;
         let changes = plan(&w, &self.have()?);
+        self.docker_user()?;
         for c in &changes {
             self.change(c)?;
         }
@@ -105,7 +106,25 @@ impl<R: Run> Agent<R> {
     fn have(&mut self) -> Result<Have> {
         let mut h = Have { peers: parse_dump(&self.run.run("wg", &["show", IFACE, "dump"], None)?), ..Default::default() };
         h.routes = parse_routes(&self.run.run("ip", &["-4", "route", "show", "dev", IFACE], None)?);
+        h.addresses = parse_addresses(&self.run.run("ip", &["-4", "-o", "addr", "show", "dev", IFACE], None)?);
         Ok(h)
+    }
+
+    /// Docker drops in its FORWARD chain what it did not publish itself; the mesh's forwarded connections into the
+    /// overlay and their replies are let through in `DOCKER-USER`, the chain Docker keeps for its users and never
+    /// flushes. Added once, only where Docker is.
+    fn docker_user(&mut self) -> Result<()> {
+        if self.run.run("iptables", &["-S", "DOCKER-USER"], None).is_err() {
+            return Ok(());
+        }
+        for rule in [["-o", IFACE, "-m", "conntrack", "--ctstate", "DNAT", "-j", "ACCEPT"], ["-i", IFACE, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"]] {
+            let check: Vec<&str> = ["-C", "DOCKER-USER"].into_iter().chain(rule).collect();
+            if self.run.run("iptables", &check, None).is_err() {
+                let add: Vec<&str> = ["-I", "DOCKER-USER"].into_iter().chain(rule).collect();
+                self.run.run("iptables", &add, None)?;
+            }
+        }
+        Ok(())
     }
 
     fn change(&mut self, c: &Change) -> Result<()> {
@@ -128,6 +147,12 @@ impl<R: Run> Agent<R> {
             Change::RemoveRoute(r) => {
                 self.run.run("ip", &["route", "del", r, "dev", IFACE], None)?;
             }
+            Change::AddAddress(a) => {
+                self.run.run("ip", &["addr", "add", a, "dev", IFACE], None)?;
+            }
+            Change::RemoveAddress(a) => {
+                self.run.run("ip", &["addr", "del", a, "dev", IFACE], None)?;
+            }
         }
         Ok(())
     }
@@ -144,6 +169,11 @@ fn parse_dump(text: &str) -> std::collections::BTreeMap<String, Peer> {
             (f.len() >= 4).then(|| (f[0].to_string(), Peer { endpoint: none(f[2]), allowed: none(f[3]).split(',').filter(|a| !a.is_empty()).map(str::to_string).collect() }))
         })
         .collect()
+}
+
+/// `ip -4 -o addr show dev <if>`: the address after `inet` on each line.
+fn parse_addresses(text: &str) -> std::collections::BTreeSet<String> {
+    text.lines().filter_map(|l| l.split_whitespace().skip_while(|w| *w != "inet").nth(1)).map(str::to_string).collect()
 }
 
 /// `ip -4 route show dev <if>`: the destination first on each line, a host route without its `/32`.
@@ -189,6 +219,8 @@ mod tests {
             mtu: 1420,
             peers: peers.iter().map(|(k, e, a)| v1::NetworkPeer { node_id: "n".into(), public_key: k.to_string(), endpoint: e.to_string(), addresses: a.iter().map(|s| s.to_string()).collect() }).collect(),
             stacks: vec![v1::StackNetwork { stack: "web".into(), subnet: "10.240.1.0/24".into(), gateway: "10.240.1.1".into() }],
+            node_address: "10.240.0.7".into(),
+            exposures: vec![],
         }
     }
 
@@ -207,7 +239,7 @@ mod tests {
         let mut f = Fake { fail: vec!["ip -o link show dev fd0".into()], ..Default::default() };
         let mut a = Agent::new(&mut f, "/var/lib/freightdock-worker/wg.key".into());
         let changes = a.apply(&state(&[(K1, "192.0.2.1:51820", &["10.240.1.2/32"])])).unwrap();
-        assert_eq!(changes.len(), 3, "a peer and two routes: {changes:?}");
+        assert_eq!(changes.len(), 4, "a peer, two routes and the node's address: {changes:?}");
         let calls = f.calls.clone();
         let at = |c: &str| calls.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c} not in {calls:#?}"));
         assert!(at("ip link add fd0 type wireguard") < at("wg set fd0 listen-port 51820 private-key /var/lib/freightdock-worker/wg.key"));
@@ -225,6 +257,7 @@ mod tests {
         let mut f = Fake::default();
         f.out.insert("wg show fd0 dump".into(), format!("P\tQ\t51820\toff\n{K1}\t(none)\t192.0.2.1:51820\t10.240.1.2/32\t0\t0\t0\toff\n"));
         f.out.insert("ip -4 route show dev fd0".into(), "10.240.0.0/16 scope link\n10.240.1.2 scope link\n".into());
+        f.out.insert("ip -4 -o addr show dev fd0".into(), "5: fd0    inet 10.240.0.7/32 scope global fd0\\       valid_lft forever preferred_lft forever\n".into());
         let mut a = Agent::new(&mut f, "k".into());
         assert!(a.apply(&s).unwrap().is_empty());
         assert!(a.apply(&s).unwrap().is_empty());
@@ -256,6 +289,23 @@ mod tests {
         assert!(a.forget_neighbour(0, "10.240.5.3").is_err(), "pid 0 is no container");
         drop(a);
         assert_eq!(f.calls, vec!["nsenter -t 4242 -n ip neigh flush to 10.240.5.3"]);
+    }
+
+    #[test]
+    fn docker_lets_through_what_the_mesh_forwards_and_its_replies_once() {
+        let mut f = Fake { fail: vec!["iptables -C DOCKER-USER -o fd0 -m conntrack --ctstate DNAT -j ACCEPT".into(), "iptables -C DOCKER-USER -i fd0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT".into()], ..Default::default() };
+        let mut a = Agent::new(&mut f, "k".into());
+        a.apply(&state(&[])).unwrap();
+        drop(a);
+        assert!(f.calls.contains(&"iptables -I DOCKER-USER -o fd0 -m conntrack --ctstate DNAT -j ACCEPT".to_string()), "{:#?}", f.calls);
+        assert!(f.calls.contains(&"iptables -I DOCKER-USER -i fd0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT".to_string()));
+        assert!(f.calls.contains(&"ip addr add 10.240.0.7/32 dev fd0".to_string()), "the node's own address");
+        let mut f = Fake::default();
+        Agent::new(&mut f, "k".into()).apply(&state(&[])).unwrap();
+        assert!(!f.calls.iter().any(|c| c.starts_with("iptables -I")), "there already: not added twice");
+        let mut f = Fake { fail: vec!["iptables -S DOCKER-USER".into()], ..Default::default() };
+        Agent::new(&mut f, "k".into()).apply(&state(&[])).unwrap();
+        assert!(!f.calls.iter().any(|c| c.starts_with("iptables -C") || c.starts_with("iptables -I")), "no Docker, nothing to let through");
     }
 
     #[test]

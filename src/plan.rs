@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use freightdock_proto::v1;
 
 /// The overlay's interface on every node.
@@ -19,11 +19,25 @@ pub struct Peer {
     pub allowed: BTreeSet<String>,
 }
 
-/// The parts of the node the plan covers: the interface's peers by public key and the routes on it.
+/// The parts of the node the plan covers: the interface's peers by public key, the routes on it and its own
+/// addresses (the node's overlay address, G10).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Have {
     pub peers: BTreeMap<String, Peer>,
     pub routes: BTreeSet<String>,
+    pub addresses: BTreeSet<String>,
+}
+
+/// Ports the host keeps for itself, never published through the mesh: ssh, the managers' (7450 the cluster, 7451
+/// and 7452 their API) and WireGuard's.
+pub const RESERVED_PORTS: [u32; 5] = [22, 7450, 7451, 7452, 51820];
+
+/// A stack's bridge: `fd-<stack>`, or for a stack whose name makes that longer than Linux's 15 characters, `fd-`
+/// and twelve hex characters of its name's hash. Always `fd-...`, which the masquerade of what leaves the range
+/// leaves alone.
+pub fn bridge_name(stack: &str) -> String {
+    let n = format!("fd-{stack}");
+    if n.len() <= 15 { n } else { format!("fd-{}", &freightdock_proto::sha256_hex(stack.as_bytes())[..12]) }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +46,8 @@ pub enum Change {
     RemovePeer { key: String },
     AddRoute(String),
     RemoveRoute(String),
+    AddAddress(String),
+    RemoveAddress(String),
 }
 
 /// The cluster's range, `a.b.0.0/16`: its first two bytes.
@@ -65,6 +81,14 @@ pub fn want(s: &v1::NetworkState) -> Result<Have> {
     let r = range(s)?;
     let mut w = Have::default();
     w.routes.insert(s.cluster_range.clone());
+    if !s.node_address.is_empty() {
+        let a = format!("{}/32", s.node_address);
+        inside(r, &a, "32")?;
+        if a.split('.').nth(2) != Some("0") {
+            bail!("the node's address {} is not in {}.{}.0.0/24", s.node_address, r[0], r[1]);
+        }
+        w.addresses.insert(a);
+    }
     for p in &s.peers {
         if !good_key(&p.public_key) {
             bail!("node {}: {:?} is not a WireGuard key", p.node_id, p.public_key);
@@ -85,29 +109,85 @@ pub fn want(s: &v1::NetworkState) -> Result<Have> {
 /// added, so no route points at a peer that is not there.
 pub fn plan(want: &Have, have: &Have) -> Vec<Change> {
     let mut out: Vec<Change> = have.routes.difference(&want.routes).map(|r| Change::RemoveRoute(r.clone())).collect();
+    out.extend(have.addresses.difference(&want.addresses).map(|a| Change::RemoveAddress(a.clone())));
+    out.extend(want.addresses.difference(&have.addresses).map(|a| Change::AddAddress(a.clone())));
     out.extend(have.peers.keys().filter(|k| !want.peers.contains_key(*k)).map(|k| Change::RemovePeer { key: k.clone() }));
     out.extend(want.peers.iter().filter(|(k, p)| have.peers.get(*k) != Some(p)).map(|(k, p)| Change::SetPeer { key: k.clone(), peer: p.clone() }));
     out.extend(want.routes.difference(&have.routes).map(|r| Change::AddRoute(r.clone())));
     out
 }
 
-/// The node's nftables table, whole: in the forward path, a stack's addresses reach that stack's only, and any other
-/// traffic between two addresses of the cluster's range is dropped; traffic leaving the range is masqueraded. Only the range is touched; the host's own rules
-/// and Docker's are other tables.
+/// One published port's rule: `fib daddr type local <proto> dport <port> dnat ...` to its one workload, or spread over
+/// its workloads at random. `None` with nothing behind it.
+fn exposure_rule(r: [u8; 2], e: &v1::Exposure) -> Result<Option<String>> {
+    if !matches!(e.protocol.as_str(), "tcp" | "udp") {
+        bail!("{:?} is not tcp or udp", e.protocol);
+    }
+    if e.port == 0 || e.port > 65535 || RESERVED_PORTS.contains(&e.port) {
+        bail!("port {} cannot be published (0, above 65535, or the host's own)", e.port);
+    }
+    let mut to = vec![];
+    for t in &e.targets {
+        let Some((ip, port)) = t.rsplit_once(':') else { bail!("{t:?} is not address:port") };
+        inside(r, &format!("{ip}/32"), "32")?;
+        let port: u16 = port.parse().with_context(|| format!("{t:?} is not address:port"))?;
+        if port == 0 {
+            bail!("{t:?} has port 0");
+        }
+        to.push((ip.to_string(), port));
+    }
+    let head = format!("fib daddr type local {} dport {} dnat ip to", e.protocol, e.port);
+    Ok(match to.as_slice() {
+        [] => None,
+        [(ip, port)] => Some(format!("{head} {ip}:{port}")),
+        many => Some(format!("{head} numgen random mod {} map {{ {} }}", many.len(), many.iter().enumerate().map(|(i, (ip, p))| format!("{i} : {ip} . {p}")).collect::<Vec<_>>().join(", "))),
+    })
+}
+
+/// The node's nftables table, whole. In the forward path: nothing from a stack's bridge but the stack's own
+/// addresses; replies, published ports (G10) and the nodes' own addresses pass; otherwise a stack's addresses reach
+/// that stack's only, and any other traffic between two addresses of the range is dropped. The published ports are
+/// answered on every local address, before Docker's own rules, for the host's own traffic too but loopback (Docker's
+/// proxy has that). Traffic forwarded to another node, or from a workload to a published port, is masqueraded so its
+/// replies come back the way it went; traffic leaving the range is masqueraded. Only the range is touched; the
+/// host's own rules and Docker's are other tables.
 pub fn ruleset(s: &v1::NetworkState) -> Result<String> {
     let r = range(s)?;
-    let mut subnets: Vec<&str> = s.stacks.iter().map(|st| st.subnet.as_str()).collect();
+    let mut stacks: Vec<(&str, &str)> = s.stacks.iter().map(|st| (st.stack.as_str(), st.subnet.as_str())).collect();
+    stacks.sort();
+    stacks.dedup();
+    let range = &s.cluster_range;
+    let nodes = format!("{}.{}.0.0/24", r[0], r[1]);
+    let mut out = String::from("table inet freightdock {\n  chain forward {\n    type filter hook forward priority filter - 1; policy accept;\n");
+    for (stack, sub) in &stacks {
+        inside(r, sub, "24")?;
+        out.push_str(&format!("    iifname \"{}\" ip saddr != {sub} drop\n", bridge_name(stack)));
+    }
+    out.push_str(&format!("    ct state established,related accept\n    ct status dnat accept\n    ip saddr {nodes} accept\n"));
+    let mut subnets: Vec<&str> = stacks.iter().map(|(_, sub)| *sub).collect();
     subnets.sort();
     subnets.dedup();
-    let mut out = String::from("table inet freightdock {\n  chain forward {\n    type filter hook forward priority filter - 1; policy accept;\n");
     for sub in subnets {
-        inside(r, sub, "24")?;
         out.push_str(&format!("    ip saddr {sub} ip daddr {sub} accept\n"));
     }
-    out.push_str(&format!("    ip saddr {0} ip daddr {0} drop\n  }}\n", s.cluster_range));
+    out.push_str(&format!("    ip saddr {range} ip daddr {range} drop\n  }}\n"));
+    let mut rules = vec![];
+    for e in &s.exposures {
+        rules.extend(exposure_rule(r, e)?);
+    }
+    rules.sort();
+    out.push_str("  chain prerouting {\n    type nat hook prerouting priority dstnat - 10; policy accept;\n");
+    for rule in &rules {
+        out.push_str(&format!("    {rule}\n"));
+    }
+    out.push_str("  }\n  chain output {\n    type nat hook output priority dstnat - 10; policy accept;\n");
+    for rule in &rules {
+        out.push_str(&format!("    ip daddr != 127.0.0.0/8 {rule}\n"));
+    }
+    out.push_str("  }\n");
     // Stack networks have Docker's masquerade off (it would rewrite traffic into the overlay too): what leaves the
     // range for anywhere but a stack bridge or the overlay is masqueraded here.
-    out.push_str(&format!("  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    ip saddr {0} ip daddr != {0} oifname != \"fd-*\" masquerade\n  }}\n}}\n", s.cluster_range));
+    out.push_str(&format!("  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    ct status dnat oifname \"fd0\" masquerade\n    ct status dnat ip saddr {range} oifname \"fd-*\" masquerade\n    ip saddr {range} ip daddr != {range} oifname != \"fd-*\" masquerade\n  }}\n}}\n"));
     Ok(out)
 }
 
@@ -125,7 +205,73 @@ mod tests {
             mtu: 1420,
             peers: peers.iter().map(|(k, e, a)| v1::NetworkPeer { node_id: "n".into(), public_key: k.to_string(), endpoint: e.to_string(), addresses: a.iter().map(|s| s.to_string()).collect() }).collect(),
             stacks: stacks.iter().map(|(n, sub)| v1::StackNetwork { stack: n.to_string(), subnet: sub.to_string(), gateway: String::new() }).collect(),
+            node_address: String::new(),
+            exposures: vec![],
         }
+    }
+
+    fn exposure(port: u32, proto: &str, targets: &[&str]) -> v1::Exposure {
+        v1::Exposure { stack: "a".into(), protocol: proto.into(), port, targets: targets.iter().map(|t| t.to_string()).collect() }
+    }
+
+    #[test]
+    fn a_published_port_is_answered_on_every_node_and_spread_over_its_workloads() {
+        let mut s = state(&[], &[("a", "10.240.1.0/24")]);
+        s.exposures = vec![exposure(8088, "tcp", &["10.240.1.3:80", "10.240.1.4:80"]), exposure(5353, "udp", &["10.240.1.3:53"]), exposure(9000, "tcp", &[])];
+        let r = ruleset(&s).unwrap();
+        assert!(r.contains("type nat hook prerouting priority dstnat - 10;"), "before Docker's own:\n{r}");
+        assert!(r.contains("fib daddr type local tcp dport 8088 dnat ip to numgen random mod 2 map { 0 : 10.240.1.3 . 80, 1 : 10.240.1.4 . 80 }"), "{r}");
+        assert!(r.contains("fib daddr type local udp dport 5353 dnat ip to 10.240.1.3:53"), "{r}");
+        assert!(r.contains("type nat hook output priority dstnat - 10;") && r.contains("ip daddr != 127.0.0.0/8 fib daddr type local tcp dport 8088"), "the host's own, but loopback (Docker's proxy has it):\n{r}");
+        assert!(!r.contains("9000"), "nothing behind it: not answered");
+        assert!(r.contains(r#"ct status dnat oifname "fd0" masquerade"#), "forwarded to another node: its reply comes back here\n{r}");
+        assert!(r.contains(r#"ct status dnat ip saddr 10.240.0.0/16 oifname "fd-*" masquerade"#), "a workload calling a published port, maybe its own\n{r}");
+        let bad = |e: v1::Exposure| {
+            let mut s = state(&[], &[("a", "10.240.1.0/24")]);
+            s.exposures = vec![e];
+            ruleset(&s).is_err()
+        };
+        assert!(bad(exposure(8088, "tcp", &["192.168.1.5:80"])), "a target outside the range");
+        assert!(bad(exposure(8088, "sctp", &["10.240.1.3:80"])));
+        assert!(bad(exposure(0, "tcp", &["10.240.1.3:80"])));
+        assert!(bad(exposure(8088, "tcp", &["10.240.1.3"])), "address and port");
+        for port in [22, 7450, 7451, 7452, 51820] {
+            assert!(bad(exposure(port, "tcp", &["10.240.1.3:80"])), "{port} is the host's own");
+        }
+    }
+
+    #[test]
+    fn forwarded_and_answered_traffic_passes_and_a_stack_cannot_pretend_to_be_another() {
+        let r = ruleset(&state(&[], &[("web", "10.240.1.0/24")])).unwrap();
+        let at = |x: &str| r.find(x).unwrap_or_else(|| panic!("{x} not in\n{r}"));
+        let drop = at("ip saddr 10.240.0.0/16 ip daddr 10.240.0.0/16 drop");
+        assert!(at("ct state established,related accept") < drop, "replies pass");
+        assert!(at("ct status dnat accept") < drop, "a published port reaches any stack");
+        assert!(at("ip saddr 10.240.0.0/24 accept") < drop, "the nodes' own addresses (what the mesh forwards from)");
+        assert!(at(r#"iifname "fd-web" ip saddr != 10.240.1.0/24 drop"#) < at("ct status dnat accept"), "nothing from a stack's bridge but the stack's addresses, first");
+    }
+
+    #[test]
+    fn the_node_s_own_address_is_on_the_interface() {
+        let mut s = state(&[], &[]);
+        s.node_address = "10.240.0.7".into();
+        assert_eq!(want(&s).unwrap().addresses, ["10.240.0.7/32".to_string()].into());
+        s.node_address = "10.240.1.7".into();
+        assert!(want(&s).is_err(), "a node's address is in 10.240.0.0/24");
+        let have = Have { addresses: ["10.240.0.9/32".to_string()].into(), ..Default::default() };
+        s.node_address = "10.240.0.7".into();
+        let p = plan(&want(&s).unwrap(), &have);
+        assert!(p.contains(&Change::AddAddress("10.240.0.7/32".into())) && p.contains(&Change::RemoveAddress("10.240.0.9/32".into())), "{p:?}");
+    }
+
+    #[test]
+    fn a_bridge_name_fits_linux_and_starts_with_fd() {
+        assert_eq!(bridge_name("web"), "fd-web");
+        assert_eq!(bridge_name("twelve-chars"), "fd-twelve-chars");
+        let long = bridge_name("a-rather-long-stack-name");
+        assert!(long.len() <= 15 && long.starts_with("fd-"), "{long}");
+        assert_ne!(long, bridge_name("a-rather-long-stack-name2"));
+        assert_eq!(long, bridge_name("a-rather-long-stack-name"), "the same every time");
     }
 
     #[test]
