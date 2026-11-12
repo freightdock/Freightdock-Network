@@ -47,11 +47,15 @@ pub struct Agent<R: Run> {
     /// The floating addresses announced on the LAN since they came here; one whose announcement failed is tried
     /// again at the next state.
     announced: BTreeSet<String>,
+    /// The overlay's addresses as the last state applied gave them, and the bytes counted so far (G9.8).
+    seen: crate::traffic::Where,
+    meter: crate::traffic::Meter,
+    accounting: bool,
 }
 
 impl<R: Run> Agent<R> {
     pub fn new(run: R, key_path: PathBuf) -> Self {
-        Agent { run, key_path, rules: None, announced: BTreeSet::new() }
+        Agent { run, key_path, rules: None, announced: BTreeSet::new(), seen: Default::default(), meter: Default::default(), accounting: false }
     }
 
     /// Makes the node's overlay what `s` says: the interface up with the key, port and MTU, the peers and routes
@@ -74,7 +78,19 @@ impl<R: Run> Agent<R> {
             self.rules = Some(rules);
         }
         self.floating(&float)?;
+        self.seen = crate::traffic::Where::of(s);
         Ok(changes)
+    }
+
+    /// The node's share of the traffic since the last call (`traffic`): connection tracking read with its byte
+    /// counters, switched on the first time (`nf_conntrack_acct`, so connections from then on carry their bytes).
+    pub fn traffic(&mut self) -> Result<v1::TrafficReport> {
+        if !self.accounting {
+            self.run.run("sysctl", &["-qw", "net.netfilter.nf_conntrack_acct=1"], None)?;
+            self.accounting = true;
+        }
+        let text = self.run.run("conntrack", &["-L", "-o", "extended,id"], None)?;
+        Ok(self.meter.read(&crate::traffic::parse(&text), &self.seen, std::time::Instant::now()))
     }
 
     /// Takes every floating address off the node: it fenced itself, and the managers may give them to another.
@@ -454,4 +470,19 @@ mod tests {
             assert!(f.calls.is_empty(), "{bad}: nothing touched, {:#?}", f.calls);
         }
     }
+
+    #[test]
+    fn traffic_is_read_from_conntrack_with_accounting_switched_on_once() {
+        let mut f = Fake::default();
+        f.out.insert("conntrack -L -o extended,id".into(), "ipv4     2 tcp      6 431998 ESTABLISHED src=10.240.1.2 dst=10.240.1.9 sport=4 dport=80 packets=3 bytes=10 src=10.240.1.9 dst=10.240.1.2 sport=80 dport=4 packets=2 bytes=20 [ASSURED] mark=0 use=1 id=1\n".into());
+        let mut a = Agent::new(&mut f, "k".into());
+        a.apply(&state(&[(K1, "192.0.2.1:51820", &["10.240.1.9/32"])])).unwrap();
+        let r = a.traffic().unwrap();
+        assert_eq!((r.flows.len(), r.flows[0].dst.as_str(), r.flows[0].bytes_in), (1, "10.240.1.9", 20), "the peer's workload, known from the state");
+        a.traffic().unwrap();
+        drop(a);
+        assert_eq!(f.calls.iter().filter(|c| c.starts_with("sysctl -qw net.netfilter.nf_conntrack_acct=1")).count(), 1, "{:#?}", f.calls);
+        assert_eq!(f.calls.iter().filter(|c| *c == "conntrack -L -o extended,id").count(), 2);
+    }
 }
+

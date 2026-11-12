@@ -159,3 +159,15 @@ LAN interface answers ARP for it because Linux answers for any local address by 
 that sets it otherwise answers for none. A holder the cluster starts to fence is sent no floating address, and a
 worker that fences itself takes them off first, so between its own timers and the managers' presumption there is a
 gap with nobody answering (about 50 s with the default timers on the test cluster), never one with two.
+
+# G9.8: the live view of the traffic (agreed 2026-11-12: built from the flows)
+
+The owner chose flows (who talks to whom) over node links or counters per workload. Each worker reads its
+connection tracking at every heartbeat (`conntrack -L -o extended,id`, `nf_conntrack_acct` switched on by the agent)
+and reports what moved since the last one, added up per ends and port (`traffic.rs`). A connection is counted by one
+node only: the one it started on (a workload of the node to anywhere, the destination read from the reply side, so a
+published port's real target), or the one it came in on (from outside, DNATed by the mesh to a workload, or routed to
+a workload of the node). The second leg of a mesh forward comes from a node's address and is left out. A client
+outside the cluster is not named (only "outside" and the port it came in on); a destination outside is "outside"
+with its port. The managers turn the overlay addresses into workloads and nodes for the UI.
+
