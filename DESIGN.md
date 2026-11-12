@@ -71,6 +71,11 @@ and the table put in place, a container on one node fetched nginx on the other a
 source address, still reached the internet, and a container of another stack was dropped; a second run changed
 nothing.
 
+On the cluster, with the worker running the agent: a client reached `api-1` and `api-2` by name on either node; a
+service moved to the other node kept its address, and its peers reached it again about 5 s after it started there:
+the time a container's stale ARP entry for the old, local address takes to fail before it asks again and the host
+answers by proxy. A gratuitous ARP from the host when an address leaves the node would remove that wait.
+
 The agent drives the established tools rather than netlink, so what it does can be read and done by hand: `ip`,
 `wg` (wireguard-tools, installed with the node) and `nft`.
 
