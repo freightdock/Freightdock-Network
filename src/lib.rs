@@ -2,4 +2,5 @@
 //! WireGuard key ([`key`]) and makes the node's overlay what the managers' `NetworkState` says.
 
 pub mod key;
+pub mod apply;
 pub mod plan;

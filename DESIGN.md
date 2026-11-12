@@ -66,6 +66,11 @@ our own table masquerades what leaves the cluster range for anywhere but a stack
 `ip saddr <range> ip daddr != <range> oifname != "fd-*" masquerade`. With that, a container on one node reached
 nginx on the other by address, the far end saw the real source address, and both still reached the internet.
 
+The agent's own run on two workers (`examples/overlay.rs`, the same day): `fd0` made, keyed and peered by `wg`, the routes
+and the table put in place, a container on one node fetched nginx on the other at its fixed address with its own
+source address, still reached the internet, and a container of another stack was dropped; a second run changed
+nothing.
+
 The agent drives the established tools rather than netlink, so what it does can be read and done by hand: `ip`,
 `wg` (wireguard-tools, installed with the node) and `nft`.
 
@@ -88,7 +93,8 @@ reconcile, never a sequence of commands to replay.
 
 1. Contracts: the network part of the session (the node's key in its report; the desired network state down).
 2. Manager: IPAM in the state, the per-node network state, the stack's workloads given their addresses.
-3. Network: the agent (WireGuard over netlink, routes, bridges, nftables), tested in a network namespace.
+3. Network: the agent (`ip`, `wg` and `nft`: interface, peers, routes, proxy ARP, the table), tested against a fake
+   runner and by hand on two nodes; the Docker networks are the worker's.
 4. Worker: runs the agent, starts workloads on the stack network with their address and hosts.
 5. Test cluster: two stacks, a service calling another across nodes by name, a stack that cannot reach the other,
    a workload moved by recovery and reached at the same address.
