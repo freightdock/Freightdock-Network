@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
                     v1::NetworkPeer { node_id: String::new(), public_key: format!("{k}="), endpoint: e.into(), addresses: ad.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect() }
                 })
                 .collect();
-            let s = v1::NetworkState { version: 1, cluster_range: "10.240.0.0/16".into(), mtu: 1420, peers, stacks: vec![v1::StackNetwork { stack: "t".into(), subnet: a[2].clone(), gateway: String::new() }], node_address: String::new(), exposures: vec![] };
+            let s = v1::NetworkState { version: 1, cluster_range: "10.240.0.0/16".into(), mtu: 1420, peers, stacks: vec![v1::StackNetwork { stack: "t".into(), subnet: a[2].clone(), gateway: String::new() }], node_address: String::new(), exposures: vec![], floating: vec![] };
             for c in apply::Agent::new(apply::System, a[1].clone().into()).apply(&s)? {
                 println!("{c:?}");
             }
@@ -37,6 +37,7 @@ fn main() -> anyhow::Result<()> {
                 stacks: vec![v1::StackNetwork { stack: "web".into(), subnet: "10.240.1.0/24".into(), gateway: String::new() }, v1::StackNetwork { stack: "a-rather-long-stack-name".into(), subnet: "10.240.2.0/24".into(), gateway: String::new() }],
                 node_address: "10.240.0.2".into(),
                 exposures: vec![ex(8088, &["10.240.1.3:80", "10.240.1.4:80"]), ex(7453, &["10.240.1.5:7443"])],
+                floating: vec![],
             };
             print!("{}", freightdock_network::plan::ruleset(&s)?);
         }

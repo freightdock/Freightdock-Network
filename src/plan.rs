@@ -9,6 +9,9 @@ use freightdock_proto::v1;
 
 /// The overlay's interface on every node.
 pub const IFACE: &str = "fd0";
+/// The interface the node's floating addresses are on (G10.3): a dummy, so they are the node's own and its LAN
+/// interface answers ARP for them, and nothing else about the host's interfaces changes.
+pub const EXT_IFACE: &str = "fd-ext";
 
 /// One WireGuard peer as the interface holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -101,6 +104,22 @@ pub fn want(s: &v1::NetworkState) -> Result<Have> {
         w.peers.insert(p.public_key.clone(), Peer { endpoint: p.endpoint.clone(), allowed: p.addresses.iter().cloned().collect() });
     }
     Ok(w)
+}
+
+/// The floating addresses `s` gives this node, as `a.b.c.d/32`: each a unicast IPv4 address a LAN could have, never
+/// the cluster's range, a loopback, link-local, multicast or broadcast one. Refused whole otherwise.
+pub fn floating(s: &v1::NetworkState) -> Result<BTreeSet<String>> {
+    let r = range(s)?;
+    s.floating
+        .iter()
+        .map(|f| {
+            let Ok(ip) = f.parse::<std::net::Ipv4Addr>() else { bail!("the floating address {f:?} is not an IPv4 address") };
+            if ip.is_unspecified() || ip.is_loopback() || ip.is_link_local() || ip.is_multicast() || ip.is_broadcast() || ip.octets()[0] == 0 || ip.octets()[..2] == r {
+                bail!("{ip} cannot be a floating address (not a LAN's, or the cluster's own range)");
+            }
+            Ok(format!("{ip}/32"))
+        })
+        .collect()
 }
 
 /// The changes that make `have` into `want`, in a safe order: routes away first, then peers away, peers set, routes
@@ -205,6 +224,7 @@ mod tests {
             stacks: stacks.iter().map(|(n, sub)| v1::StackNetwork { stack: n.to_string(), subnet: sub.to_string(), gateway: String::new() }).collect(),
             node_address: String::new(),
             exposures: vec![],
+            floating: vec![],
         }
     }
 

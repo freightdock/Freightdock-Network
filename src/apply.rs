@@ -2,12 +2,13 @@
 //! `ip` (the interface and its routes), `wg` (its key and peers) and `nft` (the table `freightdock`). What the node
 //! has is read back from them each time, so a change made by hand, or a reboot, is put right at the next state.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use freightdock_proto::v1;
 
-use crate::plan::{Change, Have, IFACE, Peer, plan, ruleset, want};
+use crate::plan::{Change, EXT_IFACE, Have, IFACE, Peer, floating, plan, ruleset, want};
 
 /// WireGuard's port on every node.
 pub const WG_PORT: u16 = 51820;
@@ -43,11 +44,14 @@ pub struct Agent<R: Run> {
     key_path: PathBuf,
     /// The ruleset last loaded: loaded again only when the state makes another.
     rules: Option<String>,
+    /// The floating addresses announced on the LAN since they came here; one whose announcement failed is tried
+    /// again at the next state.
+    announced: BTreeSet<String>,
 }
 
 impl<R: Run> Agent<R> {
     pub fn new(run: R, key_path: PathBuf) -> Self {
-        Agent { run, key_path, rules: None }
+        Agent { run, key_path, rules: None, announced: BTreeSet::new() }
     }
 
     /// Makes the node's overlay what `s` says: the interface up with the key, port and MTU, the peers and routes
@@ -56,6 +60,7 @@ impl<R: Run> Agent<R> {
     pub fn apply(&mut self, s: &v1::NetworkState) -> Result<Vec<Change>> {
         let w = want(s)?;
         let rules = ruleset(s)?;
+        let float = floating(s)?;
         self.interface(if s.mtu == 0 { 1420 } else { s.mtu })?;
         let changes = plan(&w, &self.have()?);
         self.docker_user()?;
@@ -68,7 +73,55 @@ impl<R: Run> Agent<R> {
             self.run.run("nft", &["-f", "-"], Some(&text))?;
             self.rules = Some(rules);
         }
+        self.floating(&float)?;
         Ok(changes)
+    }
+
+    /// Takes every floating address off the node: it fenced itself, and the managers may give them to another.
+    pub fn drop_floating(&mut self) -> Result<()> {
+        self.announced.clear();
+        if self.run.run("ip", &["-o", "link", "show", "dev", EXT_IFACE], None).is_ok() {
+            self.run.run("ip", &["addr", "flush", "dev", EXT_IFACE], None)?;
+        }
+        Ok(())
+    }
+
+    /// The floating addresses on `fd-ext`, each new one announced with a gratuitous ARP on the interface its LAN is
+    /// on, so the LAN's switches and hosts learn at once that it is here now.
+    fn floating(&mut self, want: &BTreeSet<String>) -> Result<()> {
+        if self.run.run("ip", &["-o", "link", "show", "dev", EXT_IFACE], None).is_err() {
+            if want.is_empty() {
+                return Ok(());
+            }
+            self.run.run("ip", &["link", "add", EXT_IFACE, "type", "dummy"], None)?;
+        }
+        self.run.run("ip", &["link", "set", EXT_IFACE, "up"], None)?;
+        let have = parse_addresses(&self.run.run("ip", &["-4", "-o", "addr", "show", "dev", EXT_IFACE], None)?);
+        for a in have.difference(want) {
+            self.run.run("ip", &["addr", "del", a, "dev", EXT_IFACE], None)?;
+        }
+        for a in want.difference(&have) {
+            self.run.run("ip", &["addr", "add", a, "dev", EXT_IFACE], None)?;
+        }
+        self.announced.retain(|a| want.contains(a));
+        for a in want.difference(&self.announced.clone()) {
+            let ip = a.trim_end_matches("/32");
+            let dev = self.lan_of(ip)?;
+            self.run.run("arping", &["-U", "-c", "2", "-I", &dev, ip], None).with_context(|| format!("announcing {ip} on {dev}"))?;
+            self.announced.insert(a.clone());
+        }
+        Ok(())
+    }
+
+    /// The interface whose network holds `ip`, else the default route's.
+    fn lan_of(&mut self, ip: &str) -> Result<String> {
+        let ip: std::net::Ipv4Addr = ip.parse()?;
+        let lines = self.run.run("ip", &["-4", "-o", "addr", "show"], None)?;
+        if let Some(dev) = lan_holding(&lines, ip) {
+            return Ok(dev);
+        }
+        let d = self.run.run("ip", &["-4", "route", "show", "default"], None)?;
+        d.split_whitespace().skip_while(|w| *w != "dev").nth(1).map(str::to_string).with_context(|| format!("no interface for {ip}: no LAN holds it and there is no default route"))
     }
 
     /// A stack's bridge answers ARP for the stack's addresses on other nodes (they are routed to `fd0`, so the kernel
@@ -171,6 +224,18 @@ fn parse_dump(text: &str) -> std::collections::BTreeMap<String, Peer> {
         .collect()
 }
 
+/// `ip -4 -o addr show`: the interface (not the loopback nor one of ours) whose network holds `ip`.
+fn lan_holding(text: &str, ip: std::net::Ipv4Addr) -> Option<String> {
+    text.lines().find_map(|l| {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        let dev = w.get(1)?;
+        let (a, len) = w.iter().skip_while(|x| **x != "inet").nth(1)?.split_once('/')?;
+        let (a, len): (std::net::Ipv4Addr, u32) = (a.parse().ok()?, len.parse().ok()?);
+        let mask = if len == 0 { 0 } else { u32::MAX << (32 - len.min(32)) };
+        (*dev != "lo" && !dev.starts_with("fd") && len < 32 && u32::from(a) & mask == u32::from(ip) & mask).then(|| dev.to_string())
+    })
+}
+
 /// `ip -4 -o addr show dev <if>`: the address after `inet` on each line.
 fn parse_addresses(text: &str) -> std::collections::BTreeSet<String> {
     text.lines().filter_map(|l| l.split_whitespace().skip_while(|w| *w != "inet").nth(1)).map(str::to_string).collect()
@@ -221,8 +286,15 @@ mod tests {
             stacks: vec![v1::StackNetwork { stack: "web".into(), subnet: "10.240.1.0/24".into(), gateway: "10.240.1.1".into() }],
             node_address: "10.240.0.7".into(),
             exposures: vec![],
+            floating: vec![],
         }
     }
+
+    fn floating(f: &[&str]) -> v1::NetworkState {
+        v1::NetworkState { floating: f.iter().map(|s| s.to_string()).collect(), ..state(&[]) }
+    }
+
+    const LAN: &str = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n2: eth0    inet 192.0.2.5/24 brd 192.0.2.255 scope global eth0\\       valid_lft forever\n5: fd0    inet 10.240.0.7/32 scope global fd0\\       valid_lft forever\n";
 
     #[test]
     fn what_wg_and_ip_print_is_read_back_as_peers_and_routes() {
@@ -317,5 +389,69 @@ mod tests {
         assert!(a.proxy_arp("x y").is_err());
         drop(a);
         assert_eq!(f.calls, vec!["sysctl -qw net.ipv4.conf.fd-web.proxy_arp=1"]);
+    }
+
+    #[test]
+    fn a_floating_address_goes_on_its_own_interface_and_is_announced_on_its_lan_once() {
+        let mut f = Fake { fail: vec!["ip -o link show dev fd-ext".into()], ..Default::default() };
+        f.out.insert("ip -4 -o addr show".into(), LAN.into());
+        let mut a = Agent::new(&mut f, "k".into());
+        a.apply(&floating(&["192.0.2.10"])).unwrap();
+        drop(a);
+        let at = |c: &str| f.calls.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c} not in {:#?}", f.calls));
+        assert!(at("ip link add fd-ext type dummy") < at("ip link set fd-ext up"));
+        assert!(at("ip addr add 192.0.2.10/32 dev fd-ext") < at("arping -U -c 2 -I eth0 192.0.2.10"), "on the interface whose network holds it");
+
+        let mut f = Fake::default();
+        f.out.insert("ip -4 -o addr show".into(), LAN.into());
+        f.out.insert("ip -4 -o addr show dev fd-ext".into(), "9: fd-ext    inet 192.0.2.10/32 scope global fd-ext\\       valid_lft forever\n".into());
+        let mut a = Agent::new(&mut f, "k".into());
+        a.apply(&floating(&["192.0.2.10"])).unwrap();
+        a.apply(&floating(&["192.0.2.10"])).unwrap();
+        drop(a);
+        assert!(!f.calls.iter().any(|c| c.starts_with("ip link add fd-ext") || c.starts_with("ip addr add 192.0.2.10")), "there already: {:#?}", f.calls);
+        assert_eq!(f.calls.iter().filter(|c| c.starts_with("arping")).count(), 1, "announced once by this agent");
+    }
+
+    #[test]
+    fn an_announcement_that_failed_is_tried_again_and_outside_a_lan_goes_by_the_default_route() {
+        let mut f = Fake { fail: vec!["arping -U -c 2 -I eth1 198.51.100.7".into()], ..Default::default() };
+        f.out.insert("ip -4 -o addr show".into(), LAN.into());
+        f.out.insert("ip -4 route show default".into(), "default via 192.0.2.1 dev eth1 proto dhcp src 192.0.2.5 metric 100\n".into());
+        let mut a = Agent::new(&mut f, "k".into());
+        assert!(a.apply(&floating(&["198.51.100.7"])).is_err(), "the announcement failed: said so");
+        assert!(a.apply(&floating(&["198.51.100.7"])).is_err());
+        drop(a);
+        assert_eq!(f.calls.iter().filter(|c| c.starts_with("arping")).count(), 2, "tried at the next state");
+    }
+
+    #[test]
+    fn a_floating_address_given_away_is_taken_off_and_all_go_when_fenced() {
+        let mut f = Fake::default();
+        f.out.insert("ip -4 -o addr show".into(), LAN.into());
+        f.out.insert("ip -4 -o addr show dev fd-ext".into(), "9: fd-ext    inet 192.0.2.10/32 scope global fd-ext\n9: fd-ext    inet 192.0.2.11/32 scope global fd-ext\n".into());
+        let mut a = Agent::new(&mut f, "k".into());
+        a.apply(&floating(&["192.0.2.10"])).unwrap();
+        a.drop_floating().unwrap();
+        drop(a);
+        assert!(f.calls.contains(&"ip addr del 192.0.2.11/32 dev fd-ext".to_string()), "{:#?}", f.calls);
+        assert!(!f.calls.contains(&"ip addr del 192.0.2.10/32 dev fd-ext".to_string()));
+        assert_eq!(f.calls.last().unwrap(), "ip addr flush dev fd-ext");
+
+        let mut f = Fake { fail: vec!["ip -o link show dev fd-ext".into()], ..Default::default() };
+        let mut a = Agent::new(&mut f, "k".into());
+        a.apply(&floating(&[])).unwrap();
+        a.drop_floating().unwrap();
+        drop(a);
+        assert!(!f.calls.iter().any(|c| c.contains("fd-ext") && !c.starts_with("ip -o link show")), "none held, no interface made: {:#?}", f.calls);
+    }
+
+    #[test]
+    fn a_floating_address_that_is_not_a_lan_s_refuses_the_state_whole() {
+        for bad in ["10.240.1.5", "127.0.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "169.254.1.1", "192.0.2.10/24", "x"] {
+            let mut f = Fake::default();
+            assert!(Agent::new(&mut f, "k".into()).apply(&floating(&[bad])).is_err(), "{bad}");
+            assert!(f.calls.is_empty(), "{bad}: nothing touched, {:#?}", f.calls);
+        }
     }
 }
