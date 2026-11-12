@@ -80,6 +80,18 @@ impl<R: Run> Agent<R> {
         Ok(())
     }
 
+    /// Forgets what a container (by its process, `pid`) knows of `addr`'s MAC: an address that left this node was
+    /// answered by its own container, and a peer that kept that answer waits for it to fail (some seconds) before it
+    /// asks again and the host answers for the address's new node. Called when that container is removed.
+    pub fn forget_neighbour(&mut self, pid: u32, addr: &str) -> Result<()> {
+        if pid == 0 {
+            bail!("pid 0 is no container's");
+        }
+        let ip: std::net::Ipv4Addr = addr.parse().with_context(|| format!("{addr:?} is not an IPv4 address"))?;
+        self.run.run("nsenter", &["-t", &pid.to_string(), "-n", "ip", "neigh", "flush", "to", &ip.to_string()], None)?;
+        Ok(())
+    }
+
     fn interface(&mut self, mtu: u32) -> Result<()> {
         if self.run.run("ip", &["-o", "link", "show", "dev", IFACE], None).is_err() {
             self.run.run("ip", &["link", "add", IFACE, "type", "wireguard"], None)?;
@@ -233,6 +245,17 @@ mod tests {
         let at = |c: &str| f.calls.iter().position(|x| x == c).unwrap();
         assert!(at("ip route del 10.240.1.9/32 dev fd0") < at(&format!("wg set fd0 peer {K2} remove")));
         assert!(!f.calls.iter().any(|c| c.contains("192.168.1.5")), "{:#?}", f.calls);
+    }
+
+    #[test]
+    fn a_neighbour_is_forgotten_inside_a_container_s_network_only_for_an_address() {
+        let mut f = Fake::default();
+        let mut a = Agent::new(&mut f, "k".into());
+        a.forget_neighbour(4242, "10.240.5.3").unwrap();
+        assert!(a.forget_neighbour(4242, "10.240.5.3; reboot").is_err());
+        assert!(a.forget_neighbour(0, "10.240.5.3").is_err(), "pid 0 is no container");
+        drop(a);
+        assert_eq!(f.calls, vec!["nsenter -t 4242 -n ip neigh flush to 10.240.5.3"]);
     }
 
     #[test]

@@ -74,7 +74,9 @@ nothing.
 On the cluster, with the worker running the agent: a client reached `api-1` and `api-2` by name on either node; a
 service moved to the other node kept its address, and its peers reached it again about 5 s after it started there:
 the time a container's stale ARP entry for the old, local address takes to fail before it asks again and the host
-answers by proxy. A gratuitous ARP from the host when an address leaves the node would remove that wait.
+answers by proxy. So when a container leaves a node, the worker has the stack's containers still there forget its
+address's MAC (`nsenter -t <pid> -n ip neigh flush to <addr>`, the established tools again): measured again, the
+clients on the old node reached the moved service without a missed request.
 
 The agent drives the established tools rather than netlink, so what it does can be read and done by hand: `ip`,
 `wg` (wireguard-tools, installed with the node) and `nft`.
