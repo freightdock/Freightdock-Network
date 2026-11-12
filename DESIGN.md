@@ -148,3 +148,7 @@ nodes' addresses through. With that: a port published by a workload on one node 
 the client's address when it came in on its own node and the forwarding node's otherwise, the host's own traffic to
 its address worked, a port was spread over two replicas, and a port taken by another stack or kept by the host was
 refused at deploy.
+
+Since G10.2 Docker publishes nothing for a workload on the overlay: the mesh alone answers its ports, on its own node
+too (the prerouting and output chains), so two replicas of a service may run on one node. A target whose node
+reports it not running is taken out of the map until it runs again.
