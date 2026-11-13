@@ -166,8 +166,9 @@ impl<R: Run> Agent<R> {
         if self.run.run("ip", &["-o", "link", "show", "dev", IFACE], None).is_err() {
             self.run.run("ip", &["link", "add", IFACE, "type", "wireguard"], None)?;
         }
-        let key = self.key_path.to_string_lossy().into_owned();
-        self.run.run("wg", &["set", IFACE, "listen-port", &WG_PORT.to_string(), "private-key", &key], None)?;
+        // On its stdin, not as a path: a confined wg (Ubuntu's AppArmor profile) opens files under /etc/wireguard only.
+        let key = std::fs::read_to_string(&self.key_path).with_context(|| format!("reading {}", self.key_path.display()))?;
+        self.run.run("wg", &["set", IFACE, "listen-port", &WG_PORT.to_string(), "private-key", "/dev/stdin"], Some(key.trim()))?;
         self.run.run("ip", &["link", "set", IFACE, "mtu", &mtu.to_string(), "up"], None)?;
         Ok(())
     }
@@ -348,6 +349,13 @@ mod tests {
         }
     }
 
+    /// A key file for the agent to read (left in the temporary directory).
+    fn key() -> std::path::PathBuf {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join("wg.key"), "a2V5\n").unwrap();
+        dir.join("wg.key")
+    }
+
     fn floating(f: &[&str]) -> v1::NetworkState {
         v1::NetworkState { floating: f.iter().map(|s| s.to_string()).collect(), ..state(&[]) }
     }
@@ -365,19 +373,37 @@ mod tests {
     }
 
     #[test]
+    fn the_key_goes_to_wg_on_its_stdin_never_as_a_path() {
+        // Ubuntu's AppArmor profile for wg (26.04) lets it open files under /etc/wireguard only.
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("wg.key");
+        std::fs::write(&key, "cHJpdmF0ZQ==\n").unwrap();
+        let mut f = Fake { fail: vec!["ip -o link show dev fd0".into()], ..Default::default() };
+        Agent::new(&mut f, key.clone()).apply(&state(&[])).unwrap();
+        assert!(f.calls.iter().any(|c| c == "wg set fd0 listen-port 51820 private-key /dev/stdin"), "{:#?}", f.calls);
+        assert!(!f.calls.iter().any(|c| c.contains(&*key.to_string_lossy())), "{:#?}", f.calls);
+        assert!(f.stdin.iter().any(|s| s.trim() == "cHJpdmF0ZQ=="), "{:?}", f.stdin);
+        let mut f = Fake { fail: vec!["ip -o link show dev fd0".into()], ..Default::default() };
+        assert!(Agent::new(&mut f, dir.path().join("none")).apply(&state(&[])).is_err(), "no key, no interface");
+    }
+
+    #[test]
     fn a_fresh_node_gets_the_interface_its_peers_routes_and_table() {
         let mut f = Fake { fail: vec!["ip -o link show dev fd0".into()], ..Default::default() };
-        let mut a = Agent::new(&mut f, "/var/lib/freightdock-worker/wg.key".into());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("wg.key"), "a2V5\n").unwrap();
+        let mut a = Agent::new(&mut f, dir.path().join("wg.key"));
         let changes = a.apply(&state(&[(K1, "192.0.2.1:51820", &["10.240.1.2/32"])])).unwrap();
         assert_eq!(changes.len(), 4, "a peer, two routes and the node's address: {changes:?}");
         let calls = f.calls.clone();
         let at = |c: &str| calls.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c} not in {calls:#?}"));
-        assert!(at("ip link add fd0 type wireguard") < at("wg set fd0 listen-port 51820 private-key /var/lib/freightdock-worker/wg.key"));
+        assert!(at("ip link add fd0 type wireguard") < at("wg set fd0 listen-port 51820 private-key /dev/stdin"));
         at("ip link set fd0 mtu 1420 up");
         assert!(at(&format!("wg set fd0 peer {K1} endpoint 192.0.2.1:51820 allowed-ips 10.240.1.2/32")) < at("ip route replace 10.240.1.2/32 dev fd0"), "the peer before its route");
         at("ip route replace 10.240.0.0/16 dev fd0");
         at("nft -f -");
-        assert!(f.stdin[0].starts_with("table inet freightdock\ndelete table inet freightdock\ntable inet freightdock {"), "replaced in one go:\n{}", f.stdin[0]);
+        let table = f.stdin.iter().find(|s| s.starts_with("table inet")).expect("the table");
+        assert!(table.starts_with("table inet freightdock\ndelete table inet freightdock\ntable inet freightdock {"), "replaced in one go:\n{table}");
         assert!(!f.calls.iter().any(|c| c.contains("AAAA") && c.contains("private")), "the private key is never on a command line");
     }
 
@@ -388,7 +414,7 @@ mod tests {
         f.out.insert("wg show fd0 dump".into(), format!("P\tQ\t51820\toff\n{K1}\t(none)\t192.0.2.1:51820\t10.240.1.2/32\t0\t0\t0\toff\n"));
         f.out.insert("ip -4 route show dev fd0".into(), "10.240.0.0/16 scope link\n10.240.1.2 scope link\n".into());
         f.out.insert("ip -4 -o addr show dev fd0".into(), "5: fd0    inet 10.240.0.7/32 scope global fd0\\       valid_lft forever preferred_lft forever\n".into());
-        let mut a = Agent::new(&mut f, "k".into());
+        let mut a = Agent::new(&mut f, key());
         assert!(a.apply(&s).unwrap().is_empty());
         assert!(a.apply(&s).unwrap().is_empty());
         drop(a);
@@ -401,7 +427,7 @@ mod tests {
         let mut f = Fake::default();
         f.out.insert("wg show fd0 dump".into(), format!("P\tQ\t51820\toff\n{K2}\t(none)\t192.0.2.2:51820\t10.240.1.9/32\t0\t0\t0\toff\n"));
         f.out.insert("ip -4 route show dev fd0".into(), "10.240.0.0/16 scope link\n10.240.1.9 scope link\n".into());
-        let mut a = Agent::new(&mut f, "k".into());
+        let mut a = Agent::new(&mut f, key());
         a.apply(&state(&[])).unwrap();
         assert!(a.apply(&state(&[(K1, "192.0.2.1:51820", &["198.51.100.5/32"])])).is_err());
         drop(a);
@@ -413,7 +439,7 @@ mod tests {
     #[test]
     fn a_neighbour_is_forgotten_inside_a_container_s_network_only_for_an_address() {
         let mut f = Fake::default();
-        let mut a = Agent::new(&mut f, "k".into());
+        let mut a = Agent::new(&mut f, key());
         a.forget_neighbour(4242, "10.240.5.3").unwrap();
         assert!(a.forget_neighbour(4242, "10.240.5.3; reboot").is_err());
         assert!(a.forget_neighbour(0, "10.240.5.3").is_err(), "pid 0 is no container");
@@ -424,24 +450,24 @@ mod tests {
     #[test]
     fn docker_lets_through_what_the_mesh_forwards_and_its_replies_once() {
         let mut f = Fake { fail: vec!["iptables -C DOCKER-USER -o fd0 -m conntrack --ctstate DNAT -j ACCEPT".into(), "iptables -C DOCKER-USER -i fd0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT".into()], ..Default::default() };
-        let mut a = Agent::new(&mut f, "k".into());
+        let mut a = Agent::new(&mut f, key());
         a.apply(&state(&[])).unwrap();
         drop(a);
         assert!(f.calls.contains(&"iptables -I DOCKER-USER -o fd0 -m conntrack --ctstate DNAT -j ACCEPT".to_string()), "{:#?}", f.calls);
         assert!(f.calls.contains(&"iptables -I DOCKER-USER -i fd0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT".to_string()));
         assert!(f.calls.contains(&"ip addr add 10.240.0.7/32 dev fd0".to_string()), "the node's own address");
         let mut f = Fake::default();
-        Agent::new(&mut f, "k".into()).apply(&state(&[])).unwrap();
+        Agent::new(&mut f, key()).apply(&state(&[])).unwrap();
         assert!(!f.calls.iter().any(|c| c.starts_with("iptables -I")), "there already: not added twice");
         let mut f = Fake { fail: vec!["iptables -S DOCKER-USER".into()], ..Default::default() };
-        Agent::new(&mut f, "k".into()).apply(&state(&[])).unwrap();
+        Agent::new(&mut f, key()).apply(&state(&[])).unwrap();
         assert!(!f.calls.iter().any(|c| c.starts_with("iptables -C") || c.starts_with("iptables -I")), "no Docker, nothing to let through");
     }
 
     #[test]
     fn a_tunnel_to_each_node_is_made_with_its_route_and_rule_and_read_back() {
         let mut f = Fake::default();
-        let mut a = Agent::new(&mut f, "/k".into());
+        let mut a = Agent::new(&mut f, key());
         let changes = a.apply(&state(&[(K1, "192.0.2.1:51820", &["10.240.0.4/32", "10.240.1.2/32"])])).unwrap();
         assert!(changes.iter().any(|c| matches!(c, Change::AddTunnel { name, .. } if name == "fdt-4")), "{changes:?}");
         let calls = f.calls.clone();
@@ -456,7 +482,7 @@ mod tests {
         assert_eq!(parse_tunnels(shown), [("fdt-4".to_string(), crate::plan::Tunnel { local: "10.240.0.7".into(), remote: "10.240.0.4".into(), mtu: 1400 })].into(), "only ours");
 
         let mut f = Fake { out: [("ip -d -o link show type ipip".to_string(), shown.to_string())].into(), ..Default::default() };
-        let mut a = Agent::new(&mut f, "/k".into());
+        let mut a = Agent::new(&mut f, key());
         a.apply(&state(&[])).unwrap();
         let calls = f.calls.clone();
         let at = |c: &str| calls.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c} not in {calls:#?}"));
@@ -466,7 +492,7 @@ mod tests {
     #[test]
     fn docker_lets_through_what_goes_by_a_tunnel_and_its_replies() {
         let mut f = Fake { fail: vec!["iptables -C DOCKER-USER -o fdt-+ -m conntrack --ctstate DNAT -j ACCEPT".into(), "iptables -C DOCKER-USER -i fdt-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT".into()], ..Default::default() };
-        Agent::new(&mut f, "/k".into()).apply(&state(&[])).unwrap();
+        Agent::new(&mut f, key()).apply(&state(&[])).unwrap();
         assert!(f.calls.contains(&"iptables -I DOCKER-USER -o fdt-+ -m conntrack --ctstate DNAT -j ACCEPT".to_string()), "{:#?}", f.calls);
         assert!(f.calls.contains(&"iptables -I DOCKER-USER -i fdt-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT".to_string()));
     }
@@ -474,7 +500,7 @@ mod tests {
     #[test]
     fn proxy_arp_is_set_on_a_bridge_by_its_name_only() {
         let mut f = Fake::default();
-        let mut a = Agent::new(&mut f, "k".into());
+        let mut a = Agent::new(&mut f, key());
         a.proxy_arp("fd-web").unwrap();
         assert!(a.proxy_arp("fd-web/../all").is_err());
         assert!(a.proxy_arp("x y").is_err());
@@ -486,7 +512,7 @@ mod tests {
     fn a_floating_address_goes_on_its_own_interface_and_is_announced_on_its_lan_once() {
         let mut f = Fake { fail: vec!["ip -o link show dev fd-ext".into()], ..Default::default() };
         f.out.insert("ip -4 -o addr show".into(), LAN.into());
-        let mut a = Agent::new(&mut f, "k".into());
+        let mut a = Agent::new(&mut f, key());
         a.apply(&floating(&["192.0.2.10"])).unwrap();
         drop(a);
         let at = |c: &str| f.calls.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c} not in {:#?}", f.calls));
@@ -496,7 +522,7 @@ mod tests {
         let mut f = Fake::default();
         f.out.insert("ip -4 -o addr show".into(), LAN.into());
         f.out.insert("ip -4 -o addr show dev fd-ext".into(), "9: fd-ext    inet 192.0.2.10/32 scope global fd-ext\\       valid_lft forever\n".into());
-        let mut a = Agent::new(&mut f, "k".into());
+        let mut a = Agent::new(&mut f, key());
         a.apply(&floating(&["192.0.2.10"])).unwrap();
         a.apply(&floating(&["192.0.2.10"])).unwrap();
         drop(a);
@@ -509,7 +535,7 @@ mod tests {
         let mut f = Fake { fail: vec!["arping -U -c 2 -I eth1 198.51.100.7".into()], ..Default::default() };
         f.out.insert("ip -4 -o addr show".into(), LAN.into());
         f.out.insert("ip -4 route show default".into(), "default via 192.0.2.1 dev eth1 proto dhcp src 192.0.2.5 metric 100\n".into());
-        let mut a = Agent::new(&mut f, "k".into());
+        let mut a = Agent::new(&mut f, key());
         assert!(a.apply(&floating(&["198.51.100.7"])).is_err(), "the announcement failed: said so");
         assert!(a.apply(&floating(&["198.51.100.7"])).is_err());
         drop(a);
@@ -521,7 +547,7 @@ mod tests {
         let mut f = Fake::default();
         f.out.insert("ip -4 -o addr show".into(), LAN.into());
         f.out.insert("ip -4 -o addr show dev fd-ext".into(), "9: fd-ext    inet 192.0.2.10/32 scope global fd-ext\n9: fd-ext    inet 192.0.2.11/32 scope global fd-ext\n".into());
-        let mut a = Agent::new(&mut f, "k".into());
+        let mut a = Agent::new(&mut f, key());
         a.apply(&floating(&["192.0.2.10"])).unwrap();
         a.drop_floating().unwrap();
         drop(a);
@@ -530,7 +556,7 @@ mod tests {
         assert_eq!(f.calls.last().unwrap(), "ip addr flush dev fd-ext");
 
         let mut f = Fake { fail: vec!["ip -o link show dev fd-ext".into()], ..Default::default() };
-        let mut a = Agent::new(&mut f, "k".into());
+        let mut a = Agent::new(&mut f, key());
         a.apply(&floating(&[])).unwrap();
         a.drop_floating().unwrap();
         drop(a);
@@ -541,7 +567,7 @@ mod tests {
     fn a_floating_address_that_is_not_a_lan_s_refuses_the_state_whole() {
         for bad in ["10.240.1.5", "127.0.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "169.254.1.1", "192.0.2.10/24", "x"] {
             let mut f = Fake::default();
-            assert!(Agent::new(&mut f, "k".into()).apply(&floating(&[bad])).is_err(), "{bad}");
+            assert!(Agent::new(&mut f, key()).apply(&floating(&[bad])).is_err(), "{bad}");
             assert!(f.calls.is_empty(), "{bad}: nothing touched, {:#?}", f.calls);
         }
     }
@@ -550,7 +576,7 @@ mod tests {
     fn traffic_is_read_from_conntrack_with_accounting_switched_on_once() {
         let mut f = Fake::default();
         f.out.insert("conntrack -L -o extended,id".into(), "ipv4     2 tcp      6 431998 ESTABLISHED src=10.240.1.2 dst=10.240.1.9 sport=4 dport=80 packets=3 bytes=10 src=10.240.1.9 dst=10.240.1.2 sport=80 dport=4 packets=2 bytes=20 [ASSURED] mark=0 use=1 id=1\n".into());
-        let mut a = Agent::new(&mut f, "k".into());
+        let mut a = Agent::new(&mut f, key());
         a.apply(&state(&[(K1, "192.0.2.1:51820", &["10.240.1.9/32"])])).unwrap();
         let r = a.traffic().unwrap();
         assert_eq!((r.flows.len(), r.flows[0].dst.as_str(), r.flows[0].bytes_in), (1, "10.240.1.9", 20), "the peer's workload, known from the state");
