@@ -133,9 +133,8 @@ address moves with the workload. Two ways to make it stable, which fit together:
   again). Gateway redundancy beyond that is G12.
 
 The client's address: a connection that comes in on the workload's own node keeps it. One forwarded to another node
-must have its reply come back through the node it came in on, so it is masqueraded to that node's overlay side, and
-the workload sees the node, not the client (as Swarm's routing mesh and Kubernetes' NodePort do by default). Keeping
-it across nodes needs policy routing on the replies, left for later. Both are refused for ports the host uses
+must have its reply come back through the node it came in on. Since G10.4 it goes there by a tunnel and keeps the
+client's address too (below); a connection from inside the cluster is still masqueraded to the node's overlay side. Both are refused for ports the host uses
 itself (22, the managers' 7450 to 7453, 51820).
 
 ### Found on the test cluster (2026-11-12)
@@ -184,3 +183,31 @@ pool address (`fib daddr type local ip daddr != { <pool held here> }`); everythi
 inside its stack, and says so in the UI. A port is unique per address and protocol, and a pool address in use cannot
 be taken out of the pool.
 
+
+# G10.4: the client's address across nodes (owner, 2026-11-13: "ip adress passthrough needs to be added by default")
+
+A workload sees the address of the client that reached its pool address or port, whichever node took the
+connection in. On by default; nothing to set.
+
+WireGuard takes from a peer only packets whose source is one of that peer's allowed addresses, so a client's address
+cannot cross `fd0` as it is. Each node therefore has an IP-in-IP tunnel to every other node, inside the overlay:
+`fdt-<n>` to the node whose overlay address ends in `n` (local and remote are the two overlay addresses, MTU the
+overlay's less 20). The node that DNATs a connection from outside the range to a workload on node `n` marks its
+packets `0xfd00 + n` (`chain steer`, after the DNAT), and an `ip rule` sends that mark to table `0xfd00 + n`, whose
+only route is the tunnel. The node at the far end marks the connection with the tunnel it came in by (`ct mark`,
+`chain tunnels`) and its replies with the same mark, so they go back by the tunnel to the node that DNATed it, which
+undoes the DNAT and answers the client. TCP's MSS is clamped to the tunnel's MTU (`chain clamp`).
+
+What keeps it tight: IP-in-IP is taken only from `fd0` (so never from the LAN, whatever its outer addresses say), a
+tunnel reaches nothing on the host itself, and what comes in by a tunnel goes only to a stack's bridge (its replies
+excepted). A tunnel needs an address of its own to forward what it receives (the node's overlay address, as on
+`fd0`) and loose reverse-path filtering (the replies come from a workload whose route is `fd0`). Docker's FORWARD
+chain lets the tunnels' connections through by two more rules in `DOCKER-USER`. A connection that came in by a
+tunnel is counted by the node that took it in, not by the workload's (G9.8).
+
+Tried on the test cluster (2026-11-13) by hand first, then built: a client on the LAN reached a pool address held by
+one worker for a workload on the other, both ways, and nginx logged the client's own address; 2 MB downloads went
+through at full size; a container and a host calling a pool address still worked (masqueraded, as before). Found:
+an IP-in-IP interface with no IPv4 address of its own drops what it receives (`ip route get ... iif` says
+"Invalid argument"), hence the address. A node not yet upgraded has no tunnel and drops what an upgraded node sends
+it by one: upgrade the workers together.

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use freightdock_proto::v1;
 
-use crate::plan::{Change, EXT_IFACE, Have, IFACE, Peer, floating, plan, ruleset, want};
+use crate::plan::{Change, EXT_IFACE, Have, IFACE, Peer, TUNNEL_PREFIX, Tunnel, floating, plan, ruleset, tunnel_mark, want};
 
 /// WireGuard's port on every node.
 pub const WG_PORT: u16 = 51820;
@@ -176,6 +176,7 @@ impl<R: Run> Agent<R> {
         let mut h = Have { peers: parse_dump(&self.run.run("wg", &["show", IFACE, "dump"], None)?), ..Default::default() };
         h.routes = parse_routes(&self.run.run("ip", &["-4", "route", "show", "dev", IFACE], None)?);
         h.addresses = parse_addresses(&self.run.run("ip", &["-4", "-o", "addr", "show", "dev", IFACE], None)?);
+        h.tunnels = parse_tunnels(&self.run.run("ip", &["-d", "-o", "link", "show", "type", "ipip"], None)?);
         Ok(h)
     }
 
@@ -186,7 +187,14 @@ impl<R: Run> Agent<R> {
         if self.run.run("iptables", &["-S", "DOCKER-USER"], None).is_err() {
             return Ok(());
         }
-        for rule in [["-o", IFACE, "-m", "conntrack", "--ctstate", "DNAT", "-j", "ACCEPT"], ["-i", IFACE, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"]] {
+        let tunnels = format!("{TUNNEL_PREFIX}+");
+        let t = tunnels.as_str();
+        for rule in [
+            ["-o", IFACE, "-m", "conntrack", "--ctstate", "DNAT", "-j", "ACCEPT"],
+            ["-i", IFACE, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+            ["-o", t, "-m", "conntrack", "--ctstate", "DNAT", "-j", "ACCEPT"],
+            ["-i", t, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+        ] {
             let check: Vec<&str> = ["-C", "DOCKER-USER"].into_iter().chain(rule).collect();
             if self.run.run("iptables", &check, None).is_err() {
                 let add: Vec<&str> = ["-I", "DOCKER-USER"].into_iter().chain(rule).collect();
@@ -222,6 +230,25 @@ impl<R: Run> Agent<R> {
             Change::RemoveAddress(a) => {
                 self.run.run("ip", &["addr", "del", a, "dev", IFACE], None)?;
             }
+            Change::AddTunnel { name, tunnel } => {
+                let mark = tunnel_mark(&tunnel.remote).context("a tunnel to a node's address")?;
+                let (m, table) = (format!("{mark:#x}"), mark.to_string());
+                self.run.run("ip", &["link", "add", name, "type", "ipip", "local", &tunnel.local, "remote", &tunnel.remote], None)?;
+                self.run.run("ip", &["link", "set", name, "mtu", &tunnel.mtu.to_string(), "up"], None)?;
+                // An interface with no address of its own forwards nothing it receives.
+                self.run.run("ip", &["addr", "add", &format!("{}/32", tunnel.local), "dev", name], None)?;
+                // The replies come in by the tunnel from a workload whose route is the overlay's: loose.
+                self.run.run("sysctl", &["-qw", &format!("net.ipv4.conf.{name}.rp_filter=2")], None)?;
+                self.run.run("ip", &["route", "replace", "default", "dev", name, "table", &table], None)?;
+                let _ = self.run.run("ip", &["rule", "del", "fwmark", &m, "lookup", &table], None);
+                self.run.run("ip", &["rule", "add", "fwmark", &m, "lookup", &table, "pref", "1000"], None)?;
+            }
+            Change::RemoveTunnel(name) => {
+                if let Some(mark) = name.strip_prefix(TUNNEL_PREFIX).and_then(|n| n.parse::<u32>().ok()).map(|n| 0xfd00 | n) {
+                    let _ = self.run.run("ip", &["rule", "del", "fwmark", &format!("{mark:#x}"), "lookup", &mark.to_string()], None);
+                }
+                self.run.run("ip", &["link", "del", name], None)?;
+            }
         }
         Ok(())
     }
@@ -250,6 +277,21 @@ fn lan_holding(text: &str, ip: std::net::Ipv4Addr) -> Option<String> {
         let mask = if len == 0 { 0 } else { u32::MAX << (32 - len.min(32)) };
         (*dev != "lo" && !dev.starts_with("fd") && len < 32 && u32::from(a) & mask == u32::from(ip) & mask).then(|| dev.to_string())
     })
+}
+
+/// `ip -d -o link show type ipip`: our tunnels (`fdt-...`), each with its two ends and MTU.
+fn parse_tunnels(text: &str) -> std::collections::BTreeMap<String, Tunnel> {
+    text.lines()
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let name = w.get(1)?.trim_end_matches(':').split('@').next()?;
+            if !name.starts_with(TUNNEL_PREFIX) {
+                return None;
+            }
+            let after = |k: &str| w.iter().position(|x| *x == k).and_then(|i| w.get(i + 1)).map(|v| v.to_string());
+            Some((name.to_string(), Tunnel { local: after("link/ipip")?, remote: after("peer")?, mtu: after("mtu")?.parse().ok()? }))
+        })
+        .collect()
 }
 
 /// `ip -4 -o addr show dev <if>`: the address after `inet` on each line.
@@ -394,6 +436,39 @@ mod tests {
         let mut f = Fake { fail: vec!["iptables -S DOCKER-USER".into()], ..Default::default() };
         Agent::new(&mut f, "k".into()).apply(&state(&[])).unwrap();
         assert!(!f.calls.iter().any(|c| c.starts_with("iptables -C") || c.starts_with("iptables -I")), "no Docker, nothing to let through");
+    }
+
+    #[test]
+    fn a_tunnel_to_each_node_is_made_with_its_route_and_rule_and_read_back() {
+        let mut f = Fake::default();
+        let mut a = Agent::new(&mut f, "/k".into());
+        let changes = a.apply(&state(&[(K1, "192.0.2.1:51820", &["10.240.0.4/32", "10.240.1.2/32"])])).unwrap();
+        assert!(changes.iter().any(|c| matches!(c, Change::AddTunnel { name, .. } if name == "fdt-4")), "{changes:?}");
+        let calls = f.calls.clone();
+        let at = |c: &str| calls.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c} not in {calls:#?}"));
+        assert!(at("ip link add fdt-4 type ipip local 10.240.0.7 remote 10.240.0.4") < at("ip link set fdt-4 mtu 1400 up"));
+        at("ip addr add 10.240.0.7/32 dev fdt-4");
+        at("sysctl -qw net.ipv4.conf.fdt-4.rp_filter=2");
+        assert!(at("ip route replace default dev fdt-4 table 64772") < at("ip rule add fwmark 0xfd04 lookup 64772 pref 1000"));
+        at("ip -d -o link show type ipip");
+
+        let shown = "4: tunl0@NONE: <NOARP> mtu 1480 qdisc noop state DOWN\\    link/ipip 0.0.0.0 brd 0.0.0.0 promiscuity 0\n75: fdt-4@NONE: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1400 qdisc noqueue state UNKNOWN\\    link/ipip 10.240.0.7 peer 10.240.0.4 promiscuity 0 \\    ipip any remote 10.240.0.4 local 10.240.0.7 ttl inherit\n";
+        assert_eq!(parse_tunnels(shown), [("fdt-4".to_string(), crate::plan::Tunnel { local: "10.240.0.7".into(), remote: "10.240.0.4".into(), mtu: 1400 })].into(), "only ours");
+
+        let mut f = Fake { out: [("ip -d -o link show type ipip".to_string(), shown.to_string())].into(), ..Default::default() };
+        let mut a = Agent::new(&mut f, "/k".into());
+        a.apply(&state(&[])).unwrap();
+        let calls = f.calls.clone();
+        let at = |c: &str| calls.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c} not in {calls:#?}"));
+        assert!(at("ip rule del fwmark 0xfd04 lookup 64772") < at("ip link del fdt-4"), "its node gone: the rule, then the tunnel");
+    }
+
+    #[test]
+    fn docker_lets_through_what_goes_by_a_tunnel_and_its_replies() {
+        let mut f = Fake { fail: vec!["iptables -C DOCKER-USER -o fdt-+ -m conntrack --ctstate DNAT -j ACCEPT".into(), "iptables -C DOCKER-USER -i fdt-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT".into()], ..Default::default() };
+        Agent::new(&mut f, "/k".into()).apply(&state(&[])).unwrap();
+        assert!(f.calls.contains(&"iptables -I DOCKER-USER -o fdt-+ -m conntrack --ctstate DNAT -j ACCEPT".to_string()), "{:#?}", f.calls);
+        assert!(f.calls.contains(&"iptables -I DOCKER-USER -i fdt-+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT".to_string()));
     }
 
     #[test]

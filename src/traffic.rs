@@ -22,6 +22,8 @@ pub struct Conn {
     pub reply_sport: u16,
     pub bytes_out: u64,
     pub bytes_in: u64,
+    /// The connection's mark: a tunnel's (G10.4) when it came in by one.
+    pub mark: u32,
 }
 
 /// `conntrack -L -o extended,id`: the tcp and udp connections over IPv4 with their bytes; anything else is skipped.
@@ -48,6 +50,7 @@ pub fn parse(text: &str) -> Vec<Conn> {
                 reply_sport: sport[1].parse().ok()?,
                 bytes_out: bytes[0].parse().ok()?,
                 bytes_in: bytes[1].parse().ok()?,
+                mark: all("mark").first().and_then(|m| m.parse().ok()).unwrap_or(0),
             })
         })
         .collect()
@@ -81,6 +84,10 @@ impl Where {
 
     /// Whom a connection is between, if it is this node's to count: (src, dst, port, published port).
     fn ends(&self, c: &Conn) -> Option<(String, String, u16, u16)> {
+        // Forwarded here by another node's mesh with the client's address kept: that node counted it.
+        if c.mark & !0xff == 0xfd00 {
+            return None;
+        }
         let natted = c.dst != c.reply_src;
         if self.local_workload(c.src) {
             return Some(if self.inside(c.reply_src) {
@@ -187,6 +194,8 @@ mod tests {
                 line(8, "tcp", "192.0.2.60", "10.240.2.3", 22, "10.240.2.3", 22, 800, 8000),
                 // ...and not here for one on w3.
                 line(9, "tcp", "192.0.2.60", "10.240.1.4", 22, "10.240.1.4", 22, 900, 9000),
+                // Forwarded here by w3's mesh by its tunnel, the client's address kept: w3 counts it.
+                line(10, "tcp", "192.0.2.70", "10.240.2.3", 80, "10.240.2.3", 80, 1000, 10000).replace("mark=0", "mark=64772"),
                 // LAN broadcast, never NATed into the cluster.
                 line(7, "udp", "192.0.2.101", "192.0.2.255", 9, "192.0.2.255", 9, 700, 0),
             ]

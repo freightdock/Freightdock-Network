@@ -12,6 +12,27 @@ pub const IFACE: &str = "fd0";
 /// The interface the node's floating addresses are on (G10.3): a dummy, so they are the node's own and its LAN
 /// interface answers ARP for them, and nothing else about the host's interfaces changes.
 pub const EXT_IFACE: &str = "fd-ext";
+/// The start of a tunnel's name (G10.4): `fdt-<n>` to the node whose overlay address ends in `n`.
+pub const TUNNEL_PREFIX: &str = "fdt-";
+
+/// An IP-in-IP tunnel to another node, inside the overlay (G10.4): a connection the mesh forwards there goes through
+/// it with the client's address kept (WireGuard alone takes from a peer only the peer's own addresses), and its
+/// replies come back the same way, to the node that DNATed it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Tunnel {
+    /// This node's overlay address and the other node's, `a.b.0.n`.
+    pub local: String,
+    pub remote: String,
+    pub mtu: u32,
+}
+
+/// The mark (and routing table) of the tunnel to the node whose overlay address is `remote`: `0xfd00` and its last
+/// byte. `None` for anything but a node's address.
+pub fn tunnel_mark(remote: &str) -> Option<u32> {
+    let ip: std::net::Ipv4Addr = remote.parse().ok()?;
+    let o = ip.octets();
+    (o[2] == 0 && (1..=254).contains(&o[3])).then(|| 0xfd00 | u32::from(o[3]))
+}
 
 /// One WireGuard peer as the interface holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -29,6 +50,7 @@ pub struct Have {
     pub peers: BTreeMap<String, Peer>,
     pub routes: BTreeSet<String>,
     pub addresses: BTreeSet<String>,
+    pub tunnels: BTreeMap<String, Tunnel>,
 }
 
 pub use freightdock_proto::RESERVED_PORTS;
@@ -49,6 +71,8 @@ pub enum Change {
     RemoveRoute(String),
     AddAddress(String),
     RemoveAddress(String),
+    AddTunnel { name: String, tunnel: Tunnel },
+    RemoveTunnel(String),
 }
 
 /// The cluster's range, `a.b.0.0/16`: its first two bytes.
@@ -102,8 +126,17 @@ pub fn want(s: &v1::NetworkState) -> Result<Have> {
             w.routes.insert(a.clone());
         }
         w.peers.insert(p.public_key.clone(), Peer { endpoint: p.endpoint.clone(), allowed: p.addresses.iter().cloned().collect() });
+        if let (false, Some(remote)) = (s.node_address.is_empty(), node_of(p)) {
+            let mtu = if s.mtu == 0 { 1420 } else { s.mtu }.saturating_sub(20);
+            w.tunnels.insert(format!("{TUNNEL_PREFIX}{}", remote.rsplit('.').next().unwrap_or_default()), Tunnel { local: s.node_address.clone(), remote, mtu });
+        }
     }
     Ok(w)
+}
+
+/// A peer's own overlay address (in `a.b.0.0/24`), without its `/32`.
+fn node_of(p: &v1::NetworkPeer) -> Option<String> {
+    p.addresses.iter().map(|a| a.trim_end_matches("/32")).find(|a| tunnel_mark(a).is_some()).map(str::to_string)
 }
 
 /// The floating addresses `s` gives this node, as `a.b.c.d/32`: each a unicast IPv4 address a LAN could have, never
@@ -131,6 +164,8 @@ pub fn plan(want: &Have, have: &Have) -> Vec<Change> {
     out.extend(have.peers.keys().filter(|k| !want.peers.contains_key(*k)).map(|k| Change::RemovePeer { key: k.clone() }));
     out.extend(want.peers.iter().filter(|(k, p)| have.peers.get(*k) != Some(p)).map(|(k, p)| Change::SetPeer { key: k.clone(), peer: p.clone() }));
     out.extend(want.routes.difference(&have.routes).map(|r| Change::AddRoute(r.clone())));
+    out.extend(have.tunnels.iter().filter(|(n, t)| want.tunnels.get(*n) != Some(t)).map(|(n, _)| Change::RemoveTunnel(n.clone())));
+    out.extend(want.tunnels.iter().filter(|(n, t)| have.tunnels.get(*n) != Some(t)).map(|(n, t)| Change::AddTunnel { name: n.clone(), tunnel: t.clone() }));
     out
 }
 
@@ -184,6 +219,8 @@ pub fn ruleset(s: &v1::NetworkState) -> Result<String> {
     let range = &s.cluster_range;
     let nodes = format!("{}.{}.0.0/24", r[0], r[1]);
     let mut out = String::from("table inet freightdock {\n  chain forward {\n    type filter hook forward priority filter - 1; policy accept;\n");
+    // A tunnel carries only what the mesh forwarded to a workload here, and its replies.
+    out.push_str(&format!("    iifname \"{TUNNEL_PREFIX}*\" ct direction original oifname != \"fd-*\" drop\n"));
     for (stack, sub) in &stacks {
         inside(r, sub, "24")?;
         out.push_str(&format!("    iifname \"{}\" ip saddr != {sub} drop\n", bridge_name(stack)));
@@ -212,9 +249,47 @@ pub fn ruleset(s: &v1::NetworkState) -> Result<String> {
         out.push_str(&format!("    ip daddr != 127.0.0.0/8 {rule}\n"));
     }
     out.push_str("  }\n");
+    out.push_str(&tunnel_rules(s, r)?);
     // Stack networks have Docker's masquerade off (it would rewrite traffic into the overlay too): what leaves the
     // range for anywhere but a stack bridge or the overlay is masqueraded here.
     out.push_str(&format!("  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    ct status dnat oifname \"fd0\" masquerade\n    ct status dnat ip saddr {range} oifname \"fd-*\" masquerade\n    ip saddr {range} ip daddr != {range} oifname != \"fd-*\" masquerade\n  }}\n}}\n"));
+    Ok(out)
+}
+
+/// The chains that keep the client's address on a connection the mesh forwards to another node (G10.4). The node
+/// that DNATs it marks it for the tunnel to the workload's node (its routing table goes there); the node at the other
+/// end marks the connection with the tunnel it came in by, and its replies go back by it. The tunnels' TCP MSS is
+/// clamped to their MTU. IP-in-IP is taken only from inside the overlay, and a tunnel reaches nothing on the host.
+fn tunnel_rules(s: &v1::NetworkState, r: [u8; 2]) -> Result<String> {
+    if s.node_address.is_empty() {
+        return Ok(String::new());
+    }
+    let mut marks = vec![];
+    let mut steer = vec![];
+    for p in &s.peers {
+        let Some(node) = node_of(p) else { continue };
+        let mark = tunnel_mark(&node).context("a node's address")?;
+        marks.push((format!("{TUNNEL_PREFIX}{}", mark & 0xff), mark));
+        for a in &p.addresses {
+            let a = a.trim_end_matches("/32");
+            if a != node {
+                inside(r, &format!("{a}/32"), "32")?;
+                steer.push(format!("{a} : {mark:#x}"));
+            }
+        }
+    }
+    marks.sort();
+    steer.sort();
+    let mut out = String::from("  chain steer {\n    type filter hook prerouting priority dstnat + 10; policy accept;\n");
+    if !steer.is_empty() {
+        out.push_str(&format!("    ct direction original ct status dnat ip saddr != {} meta mark set ip daddr map {{ {} }}\n", s.cluster_range, steer.join(", ")));
+    }
+    out.push_str("  }\n  chain tunnels {\n    type filter hook prerouting priority mangle; policy accept;\n");
+    for (name, mark) in &marks {
+        out.push_str(&format!("    iifname \"{name}\" ct state new ct mark set {mark:#x}\n    ct direction reply ct mark {mark:#x} meta mark set {mark:#x}\n"));
+    }
+    out.push_str(&format!("  }}\n  chain clamp {{\n    type filter hook forward priority mangle; policy accept;\n    oifname \"{TUNNEL_PREFIX}*\" tcp flags syn tcp option maxseg size set rt mtu\n  }}\n"));
+    out.push_str(&format!("  chain input {{\n    type filter hook input priority filter - 1; policy accept;\n    ip protocol 4 iifname != \"{IFACE}\" drop\n    iifname \"{TUNNEL_PREFIX}*\" drop\n  }}\n"));
     Ok(out)
 }
 
@@ -362,6 +437,44 @@ mod tests {
         assert!(!p.iter().any(|c| matches!(c, Change::AddRoute(r) | Change::RemoveRoute(r) if r == "10.240.0.0/16")), "the range stays");
         let first = |f: fn(&Change) -> bool| p.iter().position(f).unwrap();
         assert!(first(|c| matches!(c, Change::RemoveRoute(_))) < first(|c| matches!(c, Change::RemovePeer { .. })), "routes go before their peer");
+    }
+
+    #[test]
+    fn a_connection_forwarded_to_another_node_keeps_the_client_s_address() {
+        let mut s = state(&[(K1, "192.0.2.1:51820", &["10.240.0.4/32", "10.240.1.4/32"]), (K2, "", &["10.240.2.2/32"])], &[("a", "10.240.1.0/24")]);
+        s.node_address = "10.240.0.7".into();
+        s.exposures = vec![exposure(8088, "tcp", &["10.240.1.4:80"])];
+        let w = want(&s).unwrap();
+        assert_eq!(w.tunnels, [("fdt-4".to_string(), Tunnel { local: "10.240.0.7".into(), remote: "10.240.0.4".into(), mtu: 1400 })].into(), "one per node with an address, inside the overlay");
+        let r = ruleset(&s).unwrap();
+        let has = |x: &str| assert!(r.contains(x), "{x} not in\n{r}");
+        has("ct direction original ct status dnat ip saddr != 10.240.0.0/16 meta mark set ip daddr map { 10.240.1.4 : 0xfd04 }");
+        has("type filter hook prerouting priority dstnat + 10;");
+        has(r#"iifname "fdt-4" ct state new ct mark set 0xfd04"#);
+        has("ct direction reply ct mark 0xfd04 meta mark set 0xfd04");
+        has(r#"oifname "fdt-*" tcp flags syn tcp option maxseg size set rt mtu"#);
+        has(r#"ip protocol 4 iifname != "fd0" drop"#);
+        has(r#"iifname "fdt-*" drop"#);
+        has(r#"iifname "fdt-*" ct direction original oifname != "fd-*" drop"#);
+        assert!(!r.contains("10.240.2.2 :"), "a node with no address of its own gets no tunnel: masqueraded as before\n{r}");
+        assert_eq!(tunnel_mark("10.240.0.4"), Some(0xfd04));
+        let mut s = s.clone();
+        s.node_address.clear();
+        assert!(want(&s).unwrap().tunnels.is_empty(), "nor does a node without one");
+        assert!(!ruleset(&s).unwrap().contains("meta mark set ip daddr map"));
+    }
+
+    #[test]
+    fn a_tunnel_is_made_again_when_either_end_or_the_mtu_changes_and_goes_with_its_node() {
+        let t = |l: &str, r: &str| Tunnel { local: l.into(), remote: r.into(), mtu: 1400 };
+        let have = Have { tunnels: [("fdt-4".to_string(), t("10.240.0.7", "10.240.0.4")), ("fdt-9".to_string(), t("10.240.0.7", "10.240.0.9"))].into(), ..Default::default() };
+        let want = Have { tunnels: [("fdt-4".to_string(), t("10.240.0.8", "10.240.0.4")), ("fdt-5".to_string(), t("10.240.0.8", "10.240.0.5"))].into(), ..Default::default() };
+        let p = plan(&want, &have);
+        let at = |c: &Change| p.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c:?} not in {p:?}"));
+        assert!(at(&Change::RemoveTunnel("fdt-4".into())) < at(&Change::AddTunnel { name: "fdt-4".into(), tunnel: t("10.240.0.8", "10.240.0.4") }));
+        at(&Change::RemoveTunnel("fdt-9".into()));
+        at(&Change::AddTunnel { name: "fdt-5".into(), tunnel: t("10.240.0.8", "10.240.0.5") });
+        assert!(plan(&want, &want).is_empty());
     }
 
     #[test]
