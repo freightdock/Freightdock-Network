@@ -353,7 +353,7 @@ mod tests {
             s.exposures = vec![e];
             ruleset(&s).is_err()
         };
-        assert!(bad(exposure(8088, "tcp", &["192.168.1.5:80"])), "a target outside the range");
+        assert!(bad(exposure(8088, "tcp", &["198.51.100.5:80"])), "a target outside the range");
         assert!(bad(exposure(8088, "sctp", &["10.240.1.3:80"])));
         assert!(bad(exposure(0, "tcp", &["10.240.1.3:80"])));
         assert!(bad(exposure(8088, "tcp", &["10.240.1.3"])), "address and port");
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn a_state_that_could_reach_outside_the_range_is_refused() {
-        assert!(want(&state(&[(K1, "192.0.2.1:51820", &["192.168.1.5/32"])], &[])).is_err(), "never a route to the host's own network");
+        assert!(want(&state(&[(K1, "192.0.2.1:51820", &["198.51.100.5/32"])], &[])).is_err(), "never a route to the host's own network");
         assert!(want(&state(&[(K1, "192.0.2.1:51820", &["10.240.0.0/16"])], &[])).is_err(), "a /32, nothing wider");
         assert!(want(&state(&[("short", "192.0.2.1:51820", &[])], &[])).is_err(), "a WireGuard key");
         assert!(want(&state(&[(K1, "nowhere", &[])], &[])).is_err(), "an endpoint is host:port");
@@ -486,6 +486,6 @@ mod tests {
         assert!(r.contains("ip saddr 10.240.0.0/16 ip daddr 10.240.0.0/16 drop"), "and the rest of the range dropped:\n{r}");
         assert!(r.contains("type nat hook postrouting priority srcnat;") && r.contains(r#"ip saddr 10.240.0.0/16 ip daddr != 10.240.0.0/16 oifname != "fd-*" masquerade"#), "out to the world masqueraded, never into the overlay:\n{r}");
         assert_eq!(r, ruleset(&state(&[], &[("b", "10.240.2.0/24"), ("a", "10.240.1.0/24")])).unwrap(), "the same text for the same state");
-        assert!(ruleset(&state(&[], &[("x", "10.241.0.0/24")])).is_err(), "a subnet outside the range");
+        assert!(ruleset(&state(&[], &[("x", "198.51.100.0/24")])).is_err(), "a subnet outside the range");
     }
 }

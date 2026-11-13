@@ -403,11 +403,11 @@ mod tests {
         f.out.insert("ip -4 route show dev fd0".into(), "10.240.0.0/16 scope link\n10.240.1.9 scope link\n".into());
         let mut a = Agent::new(&mut f, "k".into());
         a.apply(&state(&[])).unwrap();
-        assert!(a.apply(&state(&[(K1, "192.0.2.1:51820", &["192.168.1.5/32"])])).is_err());
+        assert!(a.apply(&state(&[(K1, "192.0.2.1:51820", &["198.51.100.5/32"])])).is_err());
         drop(a);
         let at = |c: &str| f.calls.iter().position(|x| x == c).unwrap();
         assert!(at("ip route del 10.240.1.9/32 dev fd0") < at(&format!("wg set fd0 peer {K2} remove")));
-        assert!(!f.calls.iter().any(|c| c.contains("192.168.1.5")), "{:#?}", f.calls);
+        assert!(!f.calls.iter().any(|c| c.contains("198.51.100.5")), "{:#?}", f.calls);
     }
 
     #[test]
