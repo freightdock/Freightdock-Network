@@ -5,7 +5,7 @@ decide (the mesh between workers, stable workload IPs, routes, external exposure
 networking rather than a transport of its own.
 
 Nothing here yet, on purpose: networking is plan phase 8 and 9, after the manager and worker can run, schedule, recover
-and fence workloads. See Manager's [ROADMAP.md](https://github.com/freightdock/Manager/blob/main/ROADMAP.md). Its
+and fence workloads. See Manager's [ROADMAP.md](https://github.com/freightdock/Freightdock-Manager/blob/main/ROADMAP.md). Its
 contract will be a new file in Contracts (`network.proto`), and the choice of overlay (WireGuard, VXLAN, ...) is made
 once the requirements in the plan's section 6.6 are written down.
 
